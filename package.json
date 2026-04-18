@@ -1,0 +1,19 @@
+{
+  "name": "lft",
+  "version": "1.0.0",
+  "description": "",
+  "license": "Apache-2.0",
+  "author": "hi2ma-bu4",
+  "type": "module",
+  "main": "src/codec.ts",
+  "scripts": {
+    "build": "node dev/build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  },
+  "volta": {
+    "node": "24.15.0",
+    "npm": "11.12.1"
+  }
+}
