@@ -7,9 +7,11 @@
 
 // src/index.ts
 var LFT = class {
-  static LEVELS = 1;
-  // ここでレベルを調整
-  // --- [1] 可逆色空間 (変更なし) ---
+  static MAGIC = new Uint8Array([76, 70, 84, 33]);
+  // "LFT!"
+  static TILE_SIZE = 64;
+  // タイリングのサイズ
+  // --- [1] 色空間・予測ロジック ---
   static rgbToYCoCgR(r, g, b) {
     const co = r - b;
     const tmp = b + (co >> 1);
@@ -24,196 +26,238 @@ var LFT = class {
     const r = b + co;
     return [r, g, b];
   }
-  // --- [2] Paeth予測 (変更なし) ---
-  static paethPredictor(a, b, c) {
+  static paeth(a, b, c) {
     const p = a + b - c;
-    const pa = Math.abs(p - a);
-    const pb = Math.abs(p - b);
-    const pc = Math.abs(p - c);
+    const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
     if (pa <= pb && pa <= pc) return a;
     if (pb <= pc) return b;
     return c;
   }
-  static applyPaeth(ch, w, h, stride, decode = false) {
-    if (!decode) {
-      for (let y = h - 1; y >= 0; y--) {
-        for (let x = w - 1; x >= 0; x--) {
-          const a = x > 0 ? ch[y * stride + (x - 1)] : 0;
-          const b = y > 0 ? ch[(y - 1) * stride + x] : 0;
-          const c = x > 0 && y > 0 ? ch[(y - 1) * stride + (x - 1)] : 0;
-          ch[y * stride + x] -= this.paethPredictor(a, b, c);
-        }
-      }
-    } else {
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const a = x > 0 ? ch[y * stride + (x - 1)] : 0;
-          const b = y > 0 ? ch[(y - 1) * stride + x] : 0;
-          const c = x > 0 && y > 0 ? ch[(y - 1) * stride + (x - 1)] : 0;
-          ch[y * stride + x] += this.paethPredictor(a, b, c);
-        }
-      }
-    }
-  }
-  // --- [3] 多段IWT (変更なし) ---
-  static applyMultiLevelIWT(ch, w, h, levels, decode = false) {
-    if (!decode) {
-      for (let i = 0; i < levels; i++) {
-        const curW = w >> i;
-        const curH = h >> i;
-        if (curW < 2 || curH < 2) break;
-        this.iwtStep2D(ch, curW, curH, w);
-      }
-      this.applyPaeth(ch, w >> levels, h >> levels, w, false);
-    } else {
-      this.applyPaeth(ch, w >> levels, h >> levels, w, true);
-      for (let i = levels - 1; i >= 0; i--) {
-        const curW = w >> i;
-        const curH = h >> i;
-        if (curW < 2 || curH < 2) break;
-        this.inverseIwtStep2D(ch, curW, curH, w);
-      }
-    }
-  }
-  static iwtStep2D(ch, w, h, s) {
-    const tmp = new Int32Array(w * h);
-    const hw = w >> 1;
-    const hh = h >> 1;
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < hw; x++) {
-        const a = ch[y * s + x * 2], b = ch[y * s + x * 2 + 1];
-        tmp[y * w + x] = a + b >> 1;
-        tmp[y * w + x + hw] = a - b;
-      }
-    }
-    for (let x = 0; x < w; x++) {
-      for (let y = 0; y < hh; y++) {
-        const a = tmp[y * 2 * w + x], b = tmp[(y * 2 + 1) * w + x];
-        ch[y * s + x] = a + b >> 1;
-        ch[(y + hh) * s + x] = a - b;
-      }
-    }
-  }
-  static inverseIwtStep2D(ch, w, h, s) {
-    const tmp = new Int32Array(w * h);
-    const hw = w >> 1;
-    const hh = h >> 1;
-    for (let x = 0; x < w; x++) {
-      for (let y = 0; y < hh; y++) {
-        const sl = ch[y * s + x], d = ch[(y + hh) * s + x];
-        tmp[y * 2 * w + x] = sl + (d + 1 >> 1);
-        tmp[(y * 2 + 1) * w + x] = sl - (d >> 1);
-      }
-    }
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < hw; x++) {
-        const sl = tmp[y * w + x], d = tmp[y * w + x + hw];
-        ch[y * s + x * 2] = sl + (d + 1 >> 1);
-        ch[y * s + x * 2 + 1] = sl - (d >> 1);
-      }
-    }
-  }
-  // --- [4] 改善：サブバンド独立エントロピー推定 ---
-  static totalEstimatedSize(ch, w, h, levels) {
-    let totalBits = 0;
-    const getEntropy = (data) => {
-      if (data.length === 0) return 0;
-      const counts = /* @__PURE__ */ new Map();
-      data.forEach((v) => counts.set(v, (counts.get(v) || 0) + 1));
-      let e = 0;
-      counts.forEach((c) => {
-        const p = c / data.length;
-        e -= p * Math.log2(p);
-      });
-      return e * data.length;
-    };
-    for (let i = 0; i < levels; i++) {
-      const cw = w >> i;
-      const ch_ = h >> i;
-      const hw = cw >> 1;
-      const hh = ch_ >> 1;
-      totalBits += getEntropy(this.extractSubband(ch, w, hw, 0, hw, hh));
-      totalBits += getEntropy(this.extractSubband(ch, w, 0, hh, hw, hh));
-      totalBits += getEntropy(this.extractSubband(ch, w, hw, hh, hw, hh));
-    }
-    const lw = w >> levels;
-    const lh = h >> levels;
-    totalBits += getEntropy(this.extractSubband(ch, w, 0, 0, lw, lh));
-    return totalBits / 8;
-  }
-  static extractSubband(ch, stride, ox, oy, w, h) {
-    const out = new Int32Array(w * h);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        out[y * w + x] = ch[(oy + y) * stride + (ox + x)];
-      }
+  // --- [2] 改善: Byte-Shuffling (転置) ---
+  // 32bit整数の配列をバイト毎に分解し、上位バイトを固めることでGzipの効率を最大化する
+  static shuffle(data) {
+    const out = new Uint8Array(data.length * 4);
+    const n = data.length;
+    for (let i = 0; i < n; i++) {
+      const v = data[i] << 1 ^ data[i] >> 31;
+      out[i] = v & 255;
+      out[i + n] = v >> 8 & 255;
+      out[i + 2 * n] = v >> 16 & 255;
+      out[i + 3 * n] = v >> 24 & 255;
     }
     return out;
   }
+  static unshuffle(bytes) {
+    const n = bytes.length / 4;
+    const out = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = bytes[i] | bytes[i + n] << 8 | bytes[i + 2 * n] << 16 | bytes[i + 3 * n] << 24;
+      out[i] = v >>> 1 ^ -(v & 1);
+    }
+    return out;
+  }
+  // --- [3] IWT 変換 (タイル単位で動作) ---
+  static processIWT(ch, w, h, levels, decode = false) {
+    const s = w;
+    if (!decode) {
+      for (let i = 0; i < levels; i++) this.iwt2D(ch, w >> i, h >> i, s, false);
+      this.applyPaeth(ch, w >> levels, h >> levels, s, false);
+    } else {
+      this.applyPaeth(ch, w >> levels, h >> levels, s, true);
+      for (let i = levels - 1; i >= 0; i--) this.iwt2D(ch, w >> i, h >> i, s, true);
+    }
+  }
+  static applyPaeth(ch, w, h, s, decode) {
+    for (let y = decode ? 0 : h - 1; decode ? y < h : y >= 0; decode ? y++ : y--) {
+      for (let x = decode ? 0 : w - 1; decode ? x < w : x >= 0; decode ? x++ : x--) {
+        const a = x > 0 ? ch[y * s + (x - 1)] : 0;
+        const b = y > 0 ? ch[(y - 1) * s + x] : 0;
+        const c = x > 0 && y > 0 ? ch[(y - 1) * s + (x - 1)] : 0;
+        const p = this.paeth(a, b, c);
+        ch[y * s + x] += decode ? p : -p;
+      }
+    }
+  }
+  static iwt2D(ch, w, h, s, decode) {
+    const hw = w >> 1, hh = h >> 1;
+    if (!decode) {
+      const tmp = new Int32Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < hw; x++) {
+          const a = ch[y * s + x * 2], b = ch[y * s + x * 2 + 1];
+          tmp[y * w + x] = a + b >> 1;
+          tmp[y * w + x + hw] = a - b;
+        }
+      }
+      for (let x = 0; x < w; x++) {
+        for (let y = 0; y < hh; y++) {
+          const a = tmp[y * 2 * w + x], b = tmp[(y * 2 + 1) * w + x];
+          ch[y * s + x] = a + b >> 1;
+          ch[(y + hh) * s + x] = a - b;
+        }
+      }
+    } else {
+      const tmp = new Int32Array(w * h);
+      for (let x = 0; x < w; x++) {
+        for (let y = 0; y < hh; y++) {
+          const l = ch[y * s + x], d = ch[(y + hh) * s + x];
+          tmp[y * 2 * w + x] = l + (d + 1 >> 1);
+          tmp[(y * 2 + 1) * w + x] = l - (d >> 1);
+        }
+      }
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < hw; x++) {
+          const l = tmp[y * w + x], d = tmp[y * w + x + hw];
+          ch[y * s + x * 2] = l + (d + 1 >> 1);
+          ch[y * s + x * 2 + 1] = l - (d >> 1);
+        }
+      }
+    }
+  }
+  // --- [4] タイリングと最適化 ---
+  static async encode(w, h, planes) {
+    const cols = Math.ceil(w / this.TILE_SIZE);
+    const rows = Math.ceil(h / this.TILE_SIZE);
+    const tileMetas = new Uint8Array(cols * rows);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const tx = c * this.TILE_SIZE, ty = r * this.TILE_SIZE;
+        const tw = Math.min(this.TILE_SIZE, w - tx), th = Math.min(this.TILE_SIZE, h - ty);
+        let bestL = 0, minE = Infinity;
+        for (let l = 0; l <= 3; l++) {
+          if (tw >> l < 2 || th >> l < 2) break;
+          const score = planes.reduce((acc, p) => acc + this.testTile(p, tx, ty, tw, th, w, l), 0);
+          if (score < minE) {
+            minE = score;
+            bestL = l;
+          }
+        }
+        tileMetas[r * cols + c] = bestL;
+        planes.forEach((p) => this.processTile(p, tx, ty, tw, th, w, bestL, false));
+      }
+    }
+    const header = new DataView(new ArrayBuffer(12));
+    this.MAGIC.forEach((b, i) => header.setUint8(i, b));
+    header.setUint32(4, w);
+    header.setUint32(8, h);
+    const shuffled = this.shuffle(this.flatten(planes));
+    const payload = new Blob([header, tileMetas, shuffled]);
+    const stream = payload.stream().pipeThrough(new CompressionStream("gzip"));
+    return new Response(stream).blob();
+  }
+  static async decode(blob) {
+    const stream = blob.stream().pipeThrough(new DecompressionStream("gzip"));
+    const buf = await new Response(stream).arrayBuffer();
+    const view = new DataView(buf);
+    const w = view.getUint32(4), h = view.getUint32(8);
+    const cols = Math.ceil(w / this.TILE_SIZE), rows = Math.ceil(h / this.TILE_SIZE);
+    const tileMetas = new Uint8Array(buf, 12, cols * rows);
+    const rawData = new Uint8Array(buf, 12 + cols * rows);
+    const combined = this.unshuffle(rawData);
+    const size = w * h;
+    const planes = [combined.slice(0, size), combined.slice(size, size * 2), combined.slice(size * 2, size * 3)];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const tx = c * this.TILE_SIZE, ty = r * this.TILE_SIZE;
+        const tw = Math.min(this.TILE_SIZE, w - tx), th = Math.min(this.TILE_SIZE, h - ty);
+        const l = tileMetas[r * cols + c];
+        planes.forEach((p) => this.processTile(p, tx, ty, tw, th, w, l, true));
+      }
+    }
+    return { w, h, planes };
+  }
+  static processTile(p, tx, ty, tw, th, stride, l, decode) {
+    const tile = new Int32Array(tw * th);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) tile[y * tw + x] = p[(ty + y) * stride + (tx + x)];
+    }
+    this.processIWT(tile, tw, th, l, decode);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) p[(ty + y) * stride + (tx + x)] = tile[y * tw + x];
+    }
+  }
+  static testTile(p, tx, ty, tw, th, stride, l) {
+    const tile = new Int32Array(tw * th);
+    for (let y = 0; y < th; y++) {
+      for (let x = 0; x < tw; x++) tile[y * tw + x] = p[(ty + y) * stride + (tx + x)];
+    }
+    this.processIWT(tile, tw, th, l, false);
+    let e = 0;
+    for (let v of tile) e += Math.abs(v);
+    return e;
+  }
+  static flatten(planes) {
+    const out = new Int32Array(planes[0].length * 3);
+    out.set(planes[0], 0);
+    out.set(planes[1], planes[0].length);
+    out.set(planes[2], planes[0].length * 2);
+    return out;
+  }
 };
-var upload = document.getElementById("upload");
-upload.addEventListener("change", async (e) => {
+var originalData = null;
+var lastBlob = null;
+document.getElementById("upload")?.addEventListener("change", async (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
-  const levels = LFT.LEVELS;
   const img = await createImageBitmap(file);
-  const mask = (1 << levels) - 1;
-  const w = img.width & ~mask;
-  const h = img.height & ~mask;
-  const canvasOrig = document.getElementById("canvas-orig");
-  const ctx = canvasOrig.getContext("2d");
-  canvasOrig.width = w;
-  canvasOrig.height = h;
-  ctx.drawImage(img, 0, 0, w, h);
-  const srcData = ctx.getImageData(0, 0, w, h).data;
-  const size = w * h;
-  const planes = [new Int32Array(size), new Int32Array(size), new Int32Array(size)];
-  for (let i = 0; i < size; i++) {
-    const [y, co, cg] = LFT.rgbToYCoCgR(srcData[i * 4], srcData[i * 4 + 1], srcData[i * 4 + 2]);
+  const w = img.width, h = img.height;
+  const canvas = document.getElementById("canvas-orig");
+  const ctx = canvas.getContext("2d");
+  canvas.width = w;
+  canvas.height = h;
+  ctx.drawImage(img, 0, 0);
+  originalData = ctx.getImageData(0, 0, w, h).data;
+  const planes = [new Int32Array(w * h), new Int32Array(w * h), new Int32Array(w * h)];
+  for (let i = 0; i < w * h; i++) {
+    const [y, co, cg] = LFT.rgbToYCoCgR(originalData[i * 4], originalData[i * 4 + 1], originalData[i * 4 + 2]);
     planes[0][i] = y;
     planes[1][i] = co;
     planes[2][i] = cg;
   }
   const t0 = performance.now();
-  planes.forEach((p) => LFT.applyMultiLevelIWT(p, w, h, levels, false));
+  lastBlob = await LFT.encode(w, h, planes);
   const t1 = performance.now();
-  const planesCopy = planes.map((p) => new Int32Array(p));
-  const t2 = performance.now();
-  planesCopy.forEach((p) => LFT.applyMultiLevelIWT(p, w, h, levels, true));
-  const decoded = new Uint8ClampedArray(srcData.length);
-  for (let i = 0; i < size; i++) {
-    const [r, g, b] = LFT.yCoCgRToRgb(planesCopy[0][i], planesCopy[1][i], planesCopy[2][i]);
-    decoded[i * 4] = r;
-    decoded[i * 4 + 1] = g;
-    decoded[i * 4 + 2] = b;
-    decoded[i * 4 + 3] = srcData[i * 4 + 3];
+  document.getElementById("stat-orig-size").innerText = `${(originalData.length / 1024).toFixed(1)} KB`;
+  document.getElementById("stat-comp-size").innerText = `${(lastBlob.size / 1024).toFixed(1)} KB`;
+  document.getElementById("stat-ratio").innerText = `${(lastBlob.size / originalData.length * 100).toFixed(1)} %`;
+  document.getElementById("status-log").innerText = `\u5727\u7E2E\u5B8C\u4E86 (${(t1 - t0).toFixed(1)}ms)`;
+  document.getElementById("btn-download").disabled = false;
+});
+document.getElementById("upload-lft")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const t0 = performance.now();
+  const { w, h, planes } = await LFT.decode(file);
+  const out = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w * h; i++) {
+    const [r, g, b] = LFT.yCoCgRToRgb(planes[0][i], planes[1][i], planes[2][i]);
+    out[i * 4] = r;
+    out[i * 4 + 1] = g;
+    out[i * 4 + 2] = b;
+    out[i * 4 + 3] = 255;
   }
-  const t3 = performance.now();
+  const t1 = performance.now();
   let diffs = 0;
-  for (let i = 0; i < srcData.length; i++) if (srcData[i] !== decoded[i]) diffs++;
-  const estSize = planes.reduce((acc, p) => acc + LFT.totalEstimatedSize(p, w, h, levels), 0);
-  const origSize = srcData.length;
-  document.getElementById("stat-orig-size").innerText = `${(origSize / 1024).toFixed(1)} KB`;
-  document.getElementById("stat-comp-size").innerText = `${(estSize / 1024).toFixed(1)} KB`;
-  document.getElementById("stat-ratio").innerText = `${(estSize / origSize * 100).toFixed(1)} %`;
-  document.getElementById("stat-speed").innerText = `${(t1 - t0).toFixed(1)}ms / ${(t3 - t2).toFixed(1)}ms`;
-  const statusLog = document.getElementById("status-log");
-  statusLog.className = diffs === 0 ? "status success" : "status error";
-  statusLog.innerText = diffs === 0 ? `\u2705 \u691C\u8A3C\u6210\u529F: \u5B8C\u5168\u4E00\u81F4 (v4.1)` : `\u274C \u691C\u8A3C\u5931\u6557: ${diffs}\u7B87\u6240\u306E\u5DEE\u7570`;
-  const canvasFreq = document.getElementById("canvas-freq");
-  canvasFreq.width = w;
-  canvasFreq.height = h;
-  const freqView = new Uint8ClampedArray(srcData.length);
-  for (let i = 0; i < size; i++) {
-    freqView[i * 4] = Math.abs(planes[0][i]) * 4;
-    freqView[i * 4 + 1] = Math.abs(planes[1][i]) * 4;
-    freqView[i * 4 + 2] = Math.abs(planes[2][i]) * 4;
-    freqView[i * 4 + 3] = 255;
+  if (originalData && originalData.length === out.length) {
+    for (let i = 0; i < out.length; i++) {
+      if (originalData[i] !== out[i]) diffs++;
+    }
+  } else {
+    diffs = -1;
   }
-  canvasFreq.getContext("2d").putImageData(new ImageData(freqView, w, h), 0, 0);
-  const canvasRecon = document.getElementById("canvas-recon");
-  canvasRecon.width = w;
-  canvasRecon.height = h;
-  canvasRecon.getContext("2d").putImageData(new ImageData(decoded, w, h), 0, 0);
+  const canvas = document.getElementById("canvas-recon");
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext("2d").putImageData(new ImageData(out, w, h), 0, 0);
+  const log = document.getElementById("status-log");
+  log.innerText = diffs === 0 ? `\u2705 \u691C\u8A3C\u6210\u529F: \u5B8C\u5168\u4E00\u81F4 (${(t1 - t0).toFixed(1)}ms)` : `\u274C \u691C\u8A3C\u5931\u6557: ${diffs}\u4EF6\u306E\u5DEE\u7570`;
+  log.style.color = diffs === 0 ? "green" : "red";
+});
+document.getElementById("btn-download")?.addEventListener("click", () => {
+  if (!lastBlob) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(lastBlob);
+  a.download = "image.lft";
+  a.click();
 });
 //# sourceMappingURL=LFT.js.map
