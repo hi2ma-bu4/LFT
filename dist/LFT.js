@@ -10,8 +10,7 @@ var LFT = class {
   static MAGIC = new Uint8Array([76, 70, 84, 33]);
   // "LFT!"
   static TILE_SIZE = 64;
-  // タイリングのサイズ
-  // --- [1] 色空間・予測ロジック ---
+  // --- [1] ユーティリティ ---
   static rgbToYCoCgR(r, g, b) {
     const co = r - b;
     const tmp = b + (co >> 1);
@@ -33,11 +32,76 @@ var LFT = class {
     if (pb <= pc) return b;
     return c;
   }
-  // --- [2] 改善: Byte-Shuffling (転置) ---
-  // 32bit整数の配列をバイト毎に分解し、上位バイトを固めることでGzipの効率を最大化する
+  // --- [2] 評価と予測 ---
+  static calcEntropy(data) {
+    if (data.length === 0) return 0;
+    const counts = /* @__PURE__ */ new Map();
+    for (const v of data) counts.set(v, (counts.get(v) || 0) + 1);
+    let entropy = 0;
+    for (const count of counts.values()) {
+      const p = count / data.length;
+      entropy -= p * Math.log2(p);
+    }
+    return entropy;
+  }
+  static applyPaeth(ch, w, h, s, decode) {
+    for (let y = decode ? 0 : h - 1; decode ? y < h : y >= 0; decode ? y++ : y--) {
+      for (let x = decode ? 0 : w - 1; decode ? x < w : x >= 0; decode ? x++ : x--) {
+        const a = x > 0 ? ch[y * s + (x - 1)] : 0;
+        const b = y > 0 ? ch[(y - 1) * s + x] : 0;
+        const c = x > 0 && y > 0 ? ch[(y - 1) * s + (x - 1)] : 0;
+        const p = this.paeth(a, b, c);
+        ch[y * s + x] += decode ? p : -p;
+      }
+    }
+  }
+  static applyAlpha(Y, C, alpha, decode) {
+    if (alpha === 0) return;
+    for (let i = 1; i < Y.length; i++) {
+      const pred = Y[i] * alpha >> 5;
+      C[i] += decode ? pred : -pred;
+    }
+  }
+  // --- [3] 変換コア ---
+  static iwt2D(ch, w, h, s, decode) {
+    const hw = w >> 1, hh = h >> 1;
+    const tmp = new Int32Array(w * h);
+    if (!decode) {
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < hw; x++) {
+          const a = ch[y * s + x * 2], b = ch[y * s + x * 2 + 1];
+          tmp[y * w + x] = a + b >> 1;
+          tmp[y * w + x + hw] = a - b;
+        }
+      }
+      for (let x = 0; x < w; x++) {
+        for (let y = 0; y < hh; y++) {
+          const a = tmp[y * 2 * w + x], b = tmp[(y * 2 + 1) * w + x];
+          ch[y * s + x] = a + b >> 1;
+          ch[(y + hh) * s + x] = a - b;
+        }
+      }
+    } else {
+      for (let x = 0; x < w; x++) {
+        for (let y = 0; y < hh; y++) {
+          const l = ch[y * s + x], d = ch[(y + hh) * s + x];
+          tmp[y * 2 * w + x] = l + (d + 1 >> 1);
+          tmp[(y * 2 + 1) * w + x] = l - (d >> 1);
+        }
+      }
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < hw; x++) {
+          const l = tmp[y * w + x], d = tmp[y * w + x + hw];
+          ch[y * s + x * 2] = l + (d + 1 >> 1);
+          ch[y * s + x * 2 + 1] = l - (d >> 1);
+        }
+      }
+    }
+  }
+  // --- [4] 最適化シャッフル ---
   static shuffle(data) {
-    const out = new Uint8Array(data.length * 4);
     const n = data.length;
+    const out = new Uint8Array(n * 4);
     for (let i = 0; i < n; i++) {
       const v = data[i] << 1 ^ data[i] >> 31;
       out[i] = v & 255;
@@ -56,142 +120,139 @@ var LFT = class {
     }
     return out;
   }
-  // --- [3] IWT 変換 (タイル単位で動作) ---
-  static processIWT(ch, w, h, levels, decode = false) {
-    const s = w;
-    if (!decode) {
-      for (let i = 0; i < levels; i++) this.iwt2D(ch, w >> i, h >> i, s, false);
-      this.applyPaeth(ch, w >> levels, h >> levels, s, false);
-    } else {
-      this.applyPaeth(ch, w >> levels, h >> levels, s, true);
-      for (let i = levels - 1; i >= 0; i--) this.iwt2D(ch, w >> i, h >> i, s, true);
-    }
-  }
-  static applyPaeth(ch, w, h, s, decode) {
-    for (let y = decode ? 0 : h - 1; decode ? y < h : y >= 0; decode ? y++ : y--) {
-      for (let x = decode ? 0 : w - 1; decode ? x < w : x >= 0; decode ? x++ : x--) {
-        const a = x > 0 ? ch[y * s + (x - 1)] : 0;
-        const b = y > 0 ? ch[(y - 1) * s + x] : 0;
-        const c = x > 0 && y > 0 ? ch[(y - 1) * s + (x - 1)] : 0;
-        const p = this.paeth(a, b, c);
-        ch[y * s + x] += decode ? p : -p;
-      }
-    }
-  }
-  static iwt2D(ch, w, h, s, decode) {
-    const hw = w >> 1, hh = h >> 1;
-    if (!decode) {
-      const tmp = new Int32Array(w * h);
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < hw; x++) {
-          const a = ch[y * s + x * 2], b = ch[y * s + x * 2 + 1];
-          tmp[y * w + x] = a + b >> 1;
-          tmp[y * w + x + hw] = a - b;
-        }
-      }
-      for (let x = 0; x < w; x++) {
-        for (let y = 0; y < hh; y++) {
-          const a = tmp[y * 2 * w + x], b = tmp[(y * 2 + 1) * w + x];
-          ch[y * s + x] = a + b >> 1;
-          ch[(y + hh) * s + x] = a - b;
-        }
-      }
-    } else {
-      const tmp = new Int32Array(w * h);
-      for (let x = 0; x < w; x++) {
-        for (let y = 0; y < hh; y++) {
-          const l = ch[y * s + x], d = ch[(y + hh) * s + x];
-          tmp[y * 2 * w + x] = l + (d + 1 >> 1);
-          tmp[(y * 2 + 1) * w + x] = l - (d >> 1);
-        }
-      }
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < hw; x++) {
-          const l = tmp[y * w + x], d = tmp[y * w + x + hw];
-          ch[y * s + x * 2] = l + (d + 1 >> 1);
-          ch[y * s + x * 2 + 1] = l - (d >> 1);
-        }
-      }
-    }
-  }
-  // --- [4] タイリングと最適化 ---
+  // --- [5] メイン API ---
   static async encode(w, h, planes) {
-    const cols = Math.ceil(w / this.TILE_SIZE);
-    const rows = Math.ceil(h / this.TILE_SIZE);
-    const tileMetas = new Uint8Array(cols * rows);
+    const cols = Math.ceil(w / this.TILE_SIZE), rows = Math.ceil(h / this.TILE_SIZE);
+    const tileMetas = new Uint8Array(cols * rows * 4);
+    const packedDataList = [];
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const tx = c * this.TILE_SIZE, ty = r * this.TILE_SIZE;
         const tw = Math.min(this.TILE_SIZE, w - tx), th = Math.min(this.TILE_SIZE, h - ty);
-        let bestL = 0, minE = Infinity;
-        for (let l = 0; l <= 3; l++) {
-          if (tw >> l < 2 || th >> l < 2) break;
-          const score = planes.reduce((acc, p) => acc + this.testTile(p, tx, ty, tw, th, w, l), 0);
-          if (score < minE) {
-            minE = score;
-            bestL = l;
+        const tileLen = tw * th;
+        const tY = new Int32Array(tileLen), tCo = new Int32Array(tileLen), tCg = new Int32Array(tileLen);
+        for (let y = 0; y < th; y++) {
+          for (let x = 0; x < tw; x++) {
+            const idx = (ty + y) * w + (tx + x), tidx = y * tw + x;
+            tY[tidx] = planes[0][idx];
+            tCo[tidx] = planes[1][idx];
+            tCg[tidx] = planes[2][idx];
           }
         }
-        tileMetas[r * cols + c] = bestL;
-        planes.forEach((p) => this.processTile(p, tx, ty, tw, th, w, bestL, false));
+        let bestScore = Infinity, bestL = 0, bestP = false;
+        for (let l = 0; l <= 3; l++) {
+          if (tw >> l < 2 || th >> l < 2) break;
+          for (const p of [true, false]) {
+            const test = new Int32Array(tY);
+            for (let i = 0; i < l; i++) this.iwt2D(test, tw >> i, th >> i, tw, false);
+            if (p) this.applyPaeth(test, tw >> l, th >> l, tw, false);
+            const score = this.calcEntropy(test);
+            if (score < bestScore) {
+              bestScore = score;
+              bestL = l;
+              bestP = p;
+            }
+          }
+        }
+        for (let i = 0; i < bestL; i++) {
+          this.iwt2D(tY, tw >> i, th >> i, tw, false);
+          this.iwt2D(tCo, tw >> i, th >> i, tw, false);
+          this.iwt2D(tCg, tw >> i, th >> i, tw, false);
+        }
+        if (bestP) {
+          this.applyPaeth(tY, tw >> bestL, th >> bestL, tw, false);
+          this.applyPaeth(tCo, tw >> bestL, th >> bestL, tw, false);
+          this.applyPaeth(tCg, tw >> bestL, th >> bestL, tw, false);
+        }
+        const aCo = this.calcAlpha(tY, tCo), aCg = this.calcAlpha(tY, tCg);
+        this.applyAlpha(tY, tCo, aCo, false);
+        this.applyAlpha(tY, tCg, aCg, false);
+        const isEmpty = [tY, tCo, tCg].every((a) => a.every((v) => v === 0));
+        const mIdx = (r * cols + c) * 4;
+        tileMetas[mIdx] = bestL | (bestP ? 64 : 0) | (isEmpty ? 128 : 0);
+        tileMetas[mIdx + 1] = aCo & 255;
+        tileMetas[mIdx + 2] = aCg & 255;
+        if (!isEmpty) {
+          packedDataList.push(tY, tCo, tCg);
+        }
       }
+    }
+    const totalDataLen = packedDataList.reduce((acc, a) => acc + a.length, 0);
+    const combinedData = new Int32Array(totalDataLen);
+    let offset = 0;
+    for (const arr of packedDataList) {
+      combinedData.set(arr, offset);
+      offset += arr.length;
     }
     const header = new DataView(new ArrayBuffer(12));
     this.MAGIC.forEach((b, i) => header.setUint8(i, b));
     header.setUint32(4, w);
     header.setUint32(8, h);
-    const shuffled = this.shuffle(this.flatten(planes));
-    const payload = new Blob([header, tileMetas, shuffled]);
-    const stream = payload.stream().pipeThrough(new CompressionStream("gzip"));
-    return new Response(stream).blob();
+    const shuffled = this.shuffle(combinedData);
+    const compressed = await new Response(new Blob([tileMetas, shuffled]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+    return new Blob([header, compressed]);
+  }
+  static calcAlpha(Y, C) {
+    let sY2 = 0, sYC = 0;
+    for (let i = 1; i < Y.length; i++) {
+      sY2 += Y[i] * Y[i];
+      sYC += Y[i] * C[i];
+    }
+    return sY2 === 0 ? 0 : Math.max(-128, Math.min(127, Math.round(sYC / sY2 * 32)));
   }
   static async decode(blob) {
-    const stream = blob.stream().pipeThrough(new DecompressionStream("gzip"));
+    const headerBuf = await blob.slice(0, 12).arrayBuffer();
+    const header = new DataView(headerBuf);
+    if (!this.MAGIC.every((v, i) => v === header.getUint8(i))) throw new Error("Invalid LFT file");
+    const w = header.getUint32(4), h = header.getUint32(8);
+    const stream = blob.slice(12).stream().pipeThrough(new DecompressionStream("gzip"));
     const buf = await new Response(stream).arrayBuffer();
-    const view = new DataView(buf);
-    const w = view.getUint32(4), h = view.getUint32(8);
     const cols = Math.ceil(w / this.TILE_SIZE), rows = Math.ceil(h / this.TILE_SIZE);
-    const tileMetas = new Uint8Array(buf, 12, cols * rows);
-    const rawData = new Uint8Array(buf, 12 + cols * rows);
-    const combined = this.unshuffle(rawData);
-    const size = w * h;
-    const planes = [combined.slice(0, size), combined.slice(size, size * 2), combined.slice(size * 2, size * 3)];
+    const metaSize = cols * rows * 4;
+    const tileMetas = new Uint8Array(buf, 0, metaSize);
+    const unshuffled = this.unshuffle(new Uint8Array(buf, metaSize));
+    const planes = [new Int32Array(w * h), new Int32Array(w * h), new Int32Array(w * h)];
+    let cursor = 0;
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const tx = c * this.TILE_SIZE, ty = r * this.TILE_SIZE;
         const tw = Math.min(this.TILE_SIZE, w - tx), th = Math.min(this.TILE_SIZE, h - ty);
-        const l = tileMetas[r * cols + c];
-        planes.forEach((p) => this.processTile(p, tx, ty, tw, th, w, l, true));
+        const tileLen = tw * th;
+        const mIdx = (r * cols + c) * 4;
+        const flags = tileMetas[mIdx], aCo = tileMetas[mIdx + 1] << 24 >> 24, aCg = tileMetas[mIdx + 2] << 24 >> 24;
+        const l = flags & 63, p = (flags & 64) !== 0, empty = (flags & 128) !== 0;
+        const tY = new Int32Array(tileLen), tCo = new Int32Array(tileLen), tCg = new Int32Array(tileLen);
+        if (!empty) {
+          tY.set(unshuffled.subarray(cursor, cursor + tileLen));
+          cursor += tileLen;
+          tCo.set(unshuffled.subarray(cursor, cursor + tileLen));
+          cursor += tileLen;
+          tCg.set(unshuffled.subarray(cursor, cursor + tileLen));
+          cursor += tileLen;
+        }
+        this.applyAlpha(tY, tCo, aCo, true);
+        this.applyAlpha(tY, tCg, aCg, true);
+        if (p) {
+          this.applyPaeth(tY, tw >> l, th >> l, tw, true);
+          this.applyPaeth(tCo, tw >> l, th >> l, tw, true);
+          this.applyPaeth(tCg, tw >> l, th >> l, tw, true);
+        }
+        for (let i = l - 1; i >= 0; i--) {
+          this.iwt2D(tY, tw >> i, th >> i, tw, true);
+          this.iwt2D(tCo, tw >> i, th >> i, tw, true);
+          this.iwt2D(tCg, tw >> i, th >> i, tw, true);
+        }
+        for (let y = 0; y < th; y++) {
+          for (let x = 0; x < tw; x++) {
+            const idx = (ty + y) * w + (tx + x), tidx = y * tw + x;
+            planes[0][idx] = tY[tidx];
+            planes[1][idx] = tCo[tidx];
+            planes[2][idx] = tCg[tidx];
+          }
+        }
       }
     }
     return { w, h, planes };
-  }
-  static processTile(p, tx, ty, tw, th, stride, l, decode) {
-    const tile = new Int32Array(tw * th);
-    for (let y = 0; y < th; y++) {
-      for (let x = 0; x < tw; x++) tile[y * tw + x] = p[(ty + y) * stride + (tx + x)];
-    }
-    this.processIWT(tile, tw, th, l, decode);
-    for (let y = 0; y < th; y++) {
-      for (let x = 0; x < tw; x++) p[(ty + y) * stride + (tx + x)] = tile[y * tw + x];
-    }
-  }
-  static testTile(p, tx, ty, tw, th, stride, l) {
-    const tile = new Int32Array(tw * th);
-    for (let y = 0; y < th; y++) {
-      for (let x = 0; x < tw; x++) tile[y * tw + x] = p[(ty + y) * stride + (tx + x)];
-    }
-    this.processIWT(tile, tw, th, l, false);
-    let e = 0;
-    for (let v of tile) e += Math.abs(v);
-    return e;
-  }
-  static flatten(planes) {
-    const out = new Int32Array(planes[0].length * 3);
-    out.set(planes[0], 0);
-    out.set(planes[1], planes[0].length);
-    out.set(planes[2], planes[0].length * 2);
-    return out;
   }
 };
 var originalData = null;

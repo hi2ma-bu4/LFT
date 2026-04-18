@@ -1,8 +1,8 @@
 class LFT {
 	private static readonly MAGIC = new Uint8Array([76, 70, 84, 33]); // "LFT!"
-	private static readonly TILE_SIZE = 64; // タイリングのサイズ
+	private static readonly TILE_SIZE = 64;
 
-	// --- [1] 色空間・予測ロジック ---
+	// --- [1] ユーティリティ ---
 	public static rgbToYCoCgR(r: number, g: number, b: number): [number, number, number] {
 		const co = r - b;
 		const tmp = b + (co >> 1);
@@ -29,41 +29,17 @@ class LFT {
 		return c;
 	}
 
-	// --- [2] 改善: Byte-Shuffling (転置) ---
-	// 32bit整数の配列をバイト毎に分解し、上位バイトを固めることでGzipの効率を最大化する
-	private static shuffle(data: Int32Array): Uint8Array {
-		const out = new Uint8Array(data.length * 4);
-		const n = data.length;
-		for (let i = 0; i < n; i++) {
-			const v = (data[i] << 1) ^ (data[i] >> 31); // ZigZag内包
-			out[i] = v & 0xff; // LSB
-			out[i + n] = (v >> 8) & 0xff;
-			out[i + 2 * n] = (v >> 16) & 0xff;
-			out[i + 3 * n] = (v >> 24) & 0xff; // MSB (ここが0の連続になりやすい)
+	// --- [2] 評価と予測 ---
+	private static calcEntropy(data: Int32Array): number {
+		if (data.length === 0) return 0;
+		const counts = new Map<number, number>();
+		for (const v of data) counts.set(v, (counts.get(v) || 0) + 1);
+		let entropy = 0;
+		for (const count of counts.values()) {
+			const p = count / data.length;
+			entropy -= p * Math.log2(p);
 		}
-		return out;
-	}
-
-	private static unshuffle(bytes: Uint8Array): Int32Array {
-		const n = bytes.length / 4;
-		const out = new Int32Array(n);
-		for (let i = 0; i < n; i++) {
-			const v = bytes[i] | (bytes[i + n] << 8) | (bytes[i + 2 * n] << 16) | (bytes[i + 3 * n] << 24);
-			out[i] = (v >>> 1) ^ -(v & 1); // ZigZag復元
-		}
-		return out;
-	}
-
-	// --- [3] IWT 変換 (タイル単位で動作) ---
-	public static processIWT(ch: Int32Array, w: number, h: number, levels: number, decode = false) {
-		const s = w;
-		if (!decode) {
-			for (let i = 0; i < levels; i++) this.iwt2D(ch, w >> i, h >> i, s, false);
-			this.applyPaeth(ch, w >> levels, h >> levels, s, false);
-		} else {
-			this.applyPaeth(ch, w >> levels, h >> levels, s, true);
-			for (let i = levels - 1; i >= 0; i--) this.iwt2D(ch, w >> i, h >> i, s, true);
-		}
+		return entropy;
 	}
 
 	private static applyPaeth(ch: Int32Array, w: number, h: number, s: number, decode: boolean) {
@@ -78,11 +54,20 @@ class LFT {
 		}
 	}
 
+	private static applyAlpha(Y: Int32Array, C: Int32Array, alpha: number, decode: boolean) {
+		if (alpha === 0) return;
+		for (let i = 1; i < Y.length; i++) {
+			const pred = (Y[i] * alpha) >> 5;
+			C[i] += decode ? pred : -pred;
+		}
+	}
+
+	// --- [3] 変換コア ---
 	private static iwt2D(ch: Int32Array, w: number, h: number, s: number, decode: boolean) {
 		const hw = w >> 1,
 			hh = h >> 1;
+		const tmp = new Int32Array(w * h);
 		if (!decode) {
-			const tmp = new Int32Array(w * h);
 			for (let y = 0; y < h; y++) {
 				for (let x = 0; x < hw; x++) {
 					const a = ch[y * s + x * 2],
@@ -100,7 +85,6 @@ class LFT {
 				}
 			}
 		} else {
-			const tmp = new Int32Array(w * h);
 			for (let x = 0; x < w; x++) {
 				for (let y = 0; y < hh; y++) {
 					const l = ch[y * s + x],
@@ -120,64 +104,155 @@ class LFT {
 		}
 	}
 
-	// --- [4] タイリングと最適化 ---
-	public static async encode(w: number, h: number, planes: Int32Array[]): Promise<Blob> {
-		const cols = Math.ceil(w / this.TILE_SIZE);
-		const rows = Math.ceil(h / this.TILE_SIZE);
-		const tileMetas = new Uint8Array(cols * rows); // 各タイルのレベルを記録
+	// --- [4] 最適化シャッフル ---
+	private static shuffle(data: Int32Array): Uint8Array {
+		const n = data.length;
+		const out = new Uint8Array(n * 4);
+		for (let i = 0; i < n; i++) {
+			const v = (data[i] << 1) ^ (data[i] >> 31); // ZigZag
+			out[i] = v & 0xff;
+			out[i + n] = (v >> 8) & 0xff;
+			out[i + 2 * n] = (v >> 16) & 0xff;
+			out[i + 3 * n] = (v >> 24) & 0xff;
+		}
+		return out;
+	}
 
-		// タイルごとに処理
+	private static unshuffle(bytes: Uint8Array): Int32Array {
+		const n = bytes.length / 4;
+		const out = new Int32Array(n);
+		for (let i = 0; i < n; i++) {
+			const v = bytes[i] | (bytes[i + n] << 8) | (bytes[i + 2 * n] << 16) | (bytes[i + 3 * n] << 24);
+			out[i] = (v >>> 1) ^ -(v & 1);
+		}
+		return out;
+	}
+
+	// --- [5] メイン API ---
+	public static async encode(w: number, h: number, planes: Int32Array[]): Promise<Blob> {
+		const cols = Math.ceil(w / this.TILE_SIZE),
+			rows = Math.ceil(h / this.TILE_SIZE);
+		const tileMetas = new Uint8Array(cols * rows * 4);
+		const packedDataList: Int32Array[] = [];
+
 		for (let r = 0; r < rows; r++) {
 			for (let c = 0; c < cols; c++) {
 				const tx = c * this.TILE_SIZE,
 					ty = r * this.TILE_SIZE;
 				const tw = Math.min(this.TILE_SIZE, w - tx),
 					th = Math.min(this.TILE_SIZE, h - ty);
+				const tileLen = tw * th;
+				const tY = new Int32Array(tileLen),
+					tCo = new Int32Array(tileLen),
+					tCg = new Int32Array(tileLen);
 
-				// 簡易エントロピー判定で最適なレベル(0-4)を選択
-				let bestL = 0,
-					minE = Infinity;
-				for (let l = 0; l <= 3; l++) {
-					if (tw >> l < 2 || th >> l < 2) break;
-					const score = planes.reduce((acc, p) => acc + this.testTile(p, tx, ty, tw, th, w, l), 0);
-					if (score < minE) {
-						minE = score;
-						bestL = l;
+				for (let y = 0; y < th; y++) {
+					for (let x = 0; x < tw; x++) {
+						const idx = (ty + y) * w + (tx + x),
+							tidx = y * tw + x;
+						tY[tidx] = planes[0][idx];
+						tCo[tidx] = planes[1][idx];
+						tCg[tidx] = planes[2][idx];
 					}
 				}
-				tileMetas[r * cols + c] = bestL;
-				planes.forEach((p) => this.processTile(p, tx, ty, tw, th, w, bestL, false));
+
+				// 最適な構成を探索 (Level & Paeth)
+				let bestScore = Infinity,
+					bestL = 0,
+					bestP = false;
+				for (let l = 0; l <= 3; l++) {
+					if (tw >> l < 2 || th >> l < 2) break;
+					for (const p of [true, false]) {
+						const test = new Int32Array(tY);
+						for (let i = 0; i < l; i++) this.iwt2D(test, tw >> i, th >> i, tw, false);
+						if (p) this.applyPaeth(test, tw >> l, th >> l, tw, false);
+						const score = this.calcEntropy(test);
+						if (score < bestScore) {
+							bestScore = score;
+							bestL = l;
+							bestP = p;
+						}
+					}
+				}
+
+				// 実際の変換
+				for (let i = 0; i < bestL; i++) {
+					this.iwt2D(tY, tw >> i, th >> i, tw, false);
+					this.iwt2D(tCo, tw >> i, th >> i, tw, false);
+					this.iwt2D(tCg, tw >> i, th >> i, tw, false);
+				}
+				if (bestP) {
+					this.applyPaeth(tY, tw >> bestL, th >> bestL, tw, false);
+					this.applyPaeth(tCo, tw >> bestL, th >> bestL, tw, false);
+					this.applyPaeth(tCg, tw >> bestL, th >> bestL, tw, false);
+				}
+
+				// CfL 予測
+				const aCo = this.calcAlpha(tY, tCo),
+					aCg = this.calcAlpha(tY, tCg);
+				this.applyAlpha(tY, tCo, aCo, false);
+				this.applyAlpha(tY, tCg, aCg, false);
+
+				// パッキング
+				const isEmpty = [tY, tCo, tCg].every((a) => a.every((v) => v === 0));
+				const mIdx = (r * cols + c) * 4;
+				tileMetas[mIdx] = bestL | (bestP ? 0x40 : 0) | (isEmpty ? 0x80 : 0);
+				tileMetas[mIdx + 1] = aCo & 0xff;
+				tileMetas[mIdx + 2] = aCg & 0xff;
+
+				if (!isEmpty) {
+					packedDataList.push(tY, tCo, tCg); // インターリーブ配置
+				}
 			}
 		}
 
-		// シリアライズ (Header + TileLevels + ShuffledData)
+		// シリアライズ
+		const totalDataLen = packedDataList.reduce((acc, a) => acc + a.length, 0);
+		const combinedData = new Int32Array(totalDataLen);
+		let offset = 0;
+		for (const arr of packedDataList) {
+			combinedData.set(arr, offset);
+			offset += arr.length;
+		}
+
 		const header = new DataView(new ArrayBuffer(12));
 		this.MAGIC.forEach((b, i) => header.setUint8(i, b));
 		header.setUint32(4, w);
 		header.setUint32(8, h);
 
-		const shuffled = this.shuffle(this.flatten(planes)) as Uint8Array<ArrayBuffer>;
-		const payload = new Blob([header, tileMetas, shuffled]);
+		const shuffled = this.shuffle(combinedData) as Uint8Array<ArrayBuffer>;
+		const compressed = await new Response(new Blob([tileMetas, shuffled]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+		return new Blob([header, compressed]);
+	}
 
-		const stream = payload.stream().pipeThrough(new CompressionStream("gzip"));
-		return new Response(stream).blob();
+	private static calcAlpha(Y: Int32Array, C: Int32Array): number {
+		let sY2 = 0,
+			sYC = 0;
+		for (let i = 1; i < Y.length; i++) {
+			sY2 += Y[i] * Y[i];
+			sYC += Y[i] * C[i];
+		}
+		return sY2 === 0 ? 0 : Math.max(-128, Math.min(127, Math.round((sYC / sY2) * 32)));
 	}
 
 	public static async decode(blob: Blob): Promise<{ w: number; h: number; planes: Int32Array[] }> {
-		const stream = blob.stream().pipeThrough(new DecompressionStream("gzip"));
-		const buf = await new Response(stream).arrayBuffer();
-		const view = new DataView(buf);
+		const headerBuf = await blob.slice(0, 12).arrayBuffer();
+		const header = new DataView(headerBuf);
+		if (!this.MAGIC.every((v, i) => v === header.getUint8(i))) throw new Error("Invalid LFT file");
 
-		const w = view.getUint32(4),
-			h = view.getUint32(8);
+		const w = header.getUint32(4),
+			h = header.getUint32(8);
+		const stream = blob.slice(12).stream().pipeThrough(new DecompressionStream("gzip"));
+		const buf = await new Response(stream).arrayBuffer();
+
 		const cols = Math.ceil(w / this.TILE_SIZE),
 			rows = Math.ceil(h / this.TILE_SIZE);
-		const tileMetas = new Uint8Array(buf, 12, cols * rows);
-		const rawData = new Uint8Array(buf, 12 + cols * rows);
+		const metaSize = cols * rows * 4;
+		const tileMetas = new Uint8Array(buf, 0, metaSize);
+		const unshuffled = this.unshuffle(new Uint8Array(buf, metaSize));
 
-		const combined = this.unshuffle(rawData);
-		const size = w * h;
-		const planes = [combined.slice(0, size), combined.slice(size, size * 2), combined.slice(size * 2, size * 3)];
+		const planes = [new Int32Array(w * h), new Int32Array(w * h), new Int32Array(w * h)];
+		let cursor = 0;
 
 		for (let r = 0; r < rows; r++) {
 			for (let c = 0; c < cols; c++) {
@@ -185,41 +260,52 @@ class LFT {
 					ty = r * this.TILE_SIZE;
 				const tw = Math.min(this.TILE_SIZE, w - tx),
 					th = Math.min(this.TILE_SIZE, h - ty);
-				const l = tileMetas[r * cols + c];
-				planes.forEach((p) => this.processTile(p, tx, ty, tw, th, w, l, true));
+				const tileLen = tw * th;
+				const mIdx = (r * cols + c) * 4;
+				const flags = tileMetas[mIdx],
+					aCo = (tileMetas[mIdx + 1] << 24) >> 24,
+					aCg = (tileMetas[mIdx + 2] << 24) >> 24;
+				const l = flags & 0x3f,
+					p = (flags & 0x40) !== 0,
+					empty = (flags & 0x80) !== 0;
+
+				const tY = new Int32Array(tileLen),
+					tCo = new Int32Array(tileLen),
+					tCg = new Int32Array(tileLen);
+				if (!empty) {
+					tY.set(unshuffled.subarray(cursor, cursor + tileLen));
+					cursor += tileLen;
+					tCo.set(unshuffled.subarray(cursor, cursor + tileLen));
+					cursor += tileLen;
+					tCg.set(unshuffled.subarray(cursor, cursor + tileLen));
+					cursor += tileLen;
+				}
+
+				this.applyAlpha(tY, tCo, aCo, true);
+				this.applyAlpha(tY, tCg, aCg, true);
+				if (p) {
+					this.applyPaeth(tY, tw >> l, th >> l, tw, true);
+					this.applyPaeth(tCo, tw >> l, th >> l, tw, true);
+					this.applyPaeth(tCg, tw >> l, th >> l, tw, true);
+				}
+				for (let i = l - 1; i >= 0; i--) {
+					this.iwt2D(tY, tw >> i, th >> i, tw, true);
+					this.iwt2D(tCo, tw >> i, th >> i, tw, true);
+					this.iwt2D(tCg, tw >> i, th >> i, tw, true);
+				}
+
+				for (let y = 0; y < th; y++) {
+					for (let x = 0; x < tw; x++) {
+						const idx = (ty + y) * w + (tx + x),
+							tidx = y * tw + x;
+						planes[0][idx] = tY[tidx];
+						planes[1][idx] = tCo[tidx];
+						planes[2][idx] = tCg[tidx];
+					}
+				}
 			}
 		}
 		return { w, h, planes };
-	}
-
-	private static processTile(p: Int32Array, tx: number, ty: number, tw: number, th: number, stride: number, l: number, decode: boolean) {
-		const tile = new Int32Array(tw * th);
-		for (let y = 0; y < th; y++) {
-			for (let x = 0; x < tw; x++) tile[y * tw + x] = p[(ty + y) * stride + (tx + x)];
-		}
-		this.processIWT(tile, tw, th, l, decode);
-		for (let y = 0; y < th; y++) {
-			for (let x = 0; x < tw; x++) p[(ty + y) * stride + (tx + x)] = tile[y * tw + x];
-		}
-	}
-
-	private static testTile(p: Int32Array, tx: number, ty: number, tw: number, th: number, stride: number, l: number): number {
-		const tile = new Int32Array(tw * th);
-		for (let y = 0; y < th; y++) {
-			for (let x = 0; x < tw; x++) tile[y * tw + x] = p[(ty + y) * stride + (tx + x)];
-		}
-		this.processIWT(tile, tw, th, l, false);
-		let e = 0;
-		for (let v of tile) e += Math.abs(v); // L1ノルムで代用（高速）
-		return e;
-	}
-
-	private static flatten(planes: Int32Array[]): Int32Array {
-		const out = new Int32Array(planes[0].length * 3);
-		out.set(planes[0], 0);
-		out.set(planes[1], planes[0].length);
-		out.set(planes[2], planes[0].length * 2);
-		return out;
 	}
 }
 

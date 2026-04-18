@@ -5,5 +5,12 @@
 		}
 	],
 	"settings": {
+		"cSpell.words": [
+			"Metas",
+			"Paeth",
+			"tidx",
+			"unshuffle",
+			"unshuffled"
+		]
 	}
 }
