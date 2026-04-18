@@ -1,8 +1,7 @@
 class LFT {
 	private static readonly MAGIC = new Uint8Array([76, 70, 84, 33]); // "LFT!"
-	private static readonly TILE_SIZE = 64;
 
-	// --- [1] ユーティリティ ---
+	// --- [1] 可逆色空間変換 (YCoCg-R) ---
 	public static rgbToYCoCgR(r: number, g: number, b: number): [number, number, number] {
 		const co = r - b;
 		const tmp = b + (co >> 1);
@@ -19,415 +18,267 @@ class LFT {
 		return [r, g, b];
 	}
 
-	private static paeth(a: number, b: number, c: number): number {
-		const p = a + b - c;
-		const pa = Math.abs(p - a),
-			pb = Math.abs(p - b),
-			pc = Math.abs(p - c);
-		if (pa <= pb && pa <= pc) return a;
-		if (pb <= pc) return b;
-		return c;
+	// --- [2] 予測器 (MED: Median Edge Detector) ---
+	// JPEG-LS や LOCO-I で採用される、エッジを検知して適応的に予測を切り替える強力なアルゴリズム
+	private static med(a: number, b: number, c: number): number {
+		const max = a > b ? a : b;
+		const min = a < b ? a : b;
+		if (c >= max) return min;
+		if (c <= min) return max;
+		return a + b - c;
 	}
 
-	// --- [2] 評価と予測 ---
-	private static calcEntropy(data: Int32Array): number {
-		if (data.length === 0) return 0;
-		const counts = new Map<number, number>();
-		for (const v of data) counts.set(v, (counts.get(v) || 0) + 1);
-		let entropy = 0;
-		for (const count of counts.values()) {
-			const p = count / data.length;
-			entropy -= p * Math.log2(p);
-		}
-		return entropy;
+	// --- [3] ZigZag エンコーディング ---
+	// 符号付き整数(例: -2, 1) を、符号なしの正の整数(例: 3, 2) にマッピングする
+	private static zigzag(v: number): number {
+		return (v << 1) ^ (v >> 31);
 	}
 
-	// 【改善案 4】コンテキストに基づく Paeth の改良（適応型予測）
-	private static applyPaeth(ch: Int32Array, w: number, h: number, s: number, decode: boolean) {
-		for (let y = decode ? 0 : h - 1; decode ? y < h : y >= 0; decode ? y++ : y--) {
-			for (let x = decode ? 0 : w - 1; decode ? x < w : x >= 0; decode ? x++ : x--) {
-				const a = x > 0 ? ch[y * s + (x - 1)] : 0;
-				const b = y > 0 ? ch[(y - 1) * s + x] : 0;
-				const c = x > 0 && y > 0 ? ch[(y - 1) * s + (x - 1)] : 0;
-
-				// 周辺ピクセルのエネルギー（変動）を計算
-				const energy = Math.abs(a - b) + Math.abs(a - c) + Math.abs(b - c);
-
-				// エネルギーが低い（平坦な）場所は 0 にフォールバックし、無駄な残差発生を防ぐ
-				const p = energy > 15 ? this.paeth(a, b, c) : 0;
-
-				ch[y * s + x] += decode ? p : -p;
-			}
-		}
+	private static unzigzag(v: number): number {
+		return (v >>> 1) ^ -(v & 1);
 	}
 
-	private static applyAlpha(Y: Int32Array, C: Int32Array, alpha: number, decode: boolean) {
-		if (alpha === 0) return;
-		for (let i = 1; i < Y.length; i++) {
-			const pred = (Y[i] * alpha) >> 5;
-			C[i] += decode ? pred : -pred;
-		}
-	}
-
-	// --- [3] 変換コア (5/3 整数ウェーブレット) ---
-	// 【改善案 3】IWT基底のアップグレード ($5/3$ 変換への接近)
-
-	// 1D リフティング (順変換)
-	private static iwt1D_53(src: Int32Array, srcOffset: number, stride: number, len: number, tmp: Int32Array) {
-		const half = (len + 1) >> 1;
-		for (let i = 0; i < len; i++) tmp[i] = src[srcOffset + i * stride];
-
-		// Predict (高周波の抽出)
-		for (let i = 1; i < len; i += 2) {
-			const left = tmp[i - 1];
-			const right = i + 1 < len ? tmp[i + 1] : left;
-			tmp[i] -= (left + right) >> 1;
-		}
-		// Update (低周波の更新)
-		for (let i = 0; i < len; i += 2) {
-			const left = i - 1 >= 0 ? tmp[i - 1] : i + 1 < len ? tmp[i + 1] : 0;
-			const right = i + 1 < len ? tmp[i + 1] : left;
-			tmp[i] += (left + right + 2) >> 2;
-		}
-
-		// Pack
-		for (let i = 0; i < half; i++) src[srcOffset + i * stride] = tmp[i * 2];
-		for (let i = 0; i < len >> 1; i++) src[srcOffset + (half + i) * stride] = tmp[i * 2 + 1];
-	}
-
-	// 1D リフティング (逆変換)
-	private static iiwt1D_53(src: Int32Array, srcOffset: number, stride: number, len: number, tmp: Int32Array) {
-		const half = (len + 1) >> 1;
-		// Unpack
-		for (let i = 0; i < half; i++) tmp[i * 2] = src[srcOffset + i * stride];
-		for (let i = 0; i < len >> 1; i++) tmp[i * 2 + 1] = src[srcOffset + (half + i) * stride];
-
-		// Inverse Update
-		for (let i = 0; i < len; i += 2) {
-			const left = i - 1 >= 0 ? tmp[i - 1] : i + 1 < len ? tmp[i + 1] : 0;
-			const right = i + 1 < len ? tmp[i + 1] : left;
-			tmp[i] -= (left + right + 2) >> 2;
-		}
-		// Inverse Predict
-		for (let i = 1; i < len; i += 2) {
-			const left = tmp[i - 1];
-			const right = i + 1 < len ? tmp[i + 1] : left;
-			tmp[i] += (left + right) >> 1;
-		}
-		for (let i = 0; i < len; i++) src[srcOffset + i * stride] = tmp[i];
-	}
-
-	private static iwt2D(ch: Int32Array, w: number, h: number, s: number, decode: boolean) {
-		const tmp = new Int32Array(Math.max(w, h));
-		if (!decode) {
-			// Horizontal -> Vertical
-			for (let y = 0; y < h; y++) this.iwt1D_53(ch, y * s, 1, w, tmp);
-			for (let x = 0; x < w; x++) this.iwt1D_53(ch, x, s, h, tmp);
-		} else {
-			// Vertical -> Horizontal
-			for (let x = 0; x < w; x++) this.iiwt1D_53(ch, x, s, h, tmp);
-			for (let y = 0; y < h; y++) this.iiwt1D_53(ch, y * s, 1, w, tmp);
-		}
-	}
-
-	// --- [4] サブバンド並べ替えと最適化シャッフル ---
-	// 【改善案 1】サブバンド・スキャン・オーダー（データの並び順）
-
-	private static collectSubbands(tile: Int32Array, w: number, h: number, levels: number): Int32Array {
-		if (levels === 0) return tile.slice();
-		const result = new Int32Array(tile.length);
-		const mask = new Uint8Array(tile.length);
-		let offset = 0;
-
-		const llW = w >> levels,
-			llH = h >> levels;
-		for (let y = 0; y < llH; y++) {
-			for (let x = 0; x < llW; x++) {
-				result[offset++] = tile[y * w + x];
-				mask[y * w + x] = 1;
-			}
-		}
-		for (let l = levels; l >= 1; l--) {
-			const curW = w >> (l - 1),
-				curH = h >> (l - 1);
-			for (let y = 0; y < curH; y++) {
-				for (let x = 0; x < curW; x++) {
-					if (!mask[y * w + x]) {
-						result[offset++] = tile[y * w + x];
-						mask[y * w + x] = 1;
-					}
-				}
-			}
-		}
-		// 端数（もしあれば）
-		for (let y = 0; y < h; y++) {
-			for (let x = 0; x < w; x++) {
-				if (!mask[y * w + x]) result[offset++] = tile[y * w + x];
-			}
-		}
-		return result;
-	}
-
-	private static restoreSubbands(packed: Int32Array, w: number, h: number, levels: number): Int32Array {
-		if (levels === 0) return packed.slice();
-		const result = new Int32Array(packed.length);
-		const mask = new Uint8Array(packed.length);
-		let offset = 0;
-
-		const llW = w >> levels,
-			llH = h >> levels;
-		for (let y = 0; y < llH; y++) {
-			for (let x = 0; x < llW; x++) {
-				result[y * w + x] = packed[offset++];
-				mask[y * w + x] = 1;
-			}
-		}
-		for (let l = levels; l >= 1; l--) {
-			const curW = w >> (l - 1),
-				curH = h >> (l - 1);
-			for (let y = 0; y < curH; y++) {
-				for (let x = 0; x < curW; x++) {
-					if (!mask[y * w + x]) {
-						result[y * w + x] = packed[offset++];
-						mask[y * w + x] = 1;
-					}
-				}
-			}
-		}
-		for (let y = 0; y < h; y++) {
-			for (let x = 0; x < w; x++) {
-				if (!mask[y * w + x]) result[y * w + x] = packed[offset++];
-			}
-		}
-		return result;
-	}
-
-	private static shuffle(data: Int32Array): Uint8Array {
-		const n = data.length;
-		const out = new Uint8Array(n * 4);
-		for (let i = 0; i < n; i++) {
-			const v = (data[i] << 1) ^ (data[i] >> 31); // ZigZag
-			out[i] = v & 0xff;
-			out[i + n] = (v >> 8) & 0xff;
-			out[i + 2 * n] = (v >> 16) & 0xff;
-			out[i + 3 * n] = (v >> 24) & 0xff;
-		}
-		return out;
-	}
-
-	private static unshuffle(bytes: Uint8Array): Int32Array {
-		const n = bytes.length / 4;
-		const out = new Int32Array(n);
-		for (let i = 0; i < n; i++) {
-			const v = bytes[i] | (bytes[i + n] << 8) | (bytes[i + 2 * n] << 16) | (bytes[i + 3 * n] << 24);
-			out[i] = (v >>> 1) ^ -(v & 1);
-		}
-		return out;
-	}
-
-	// --- [5] メイン API ---
+	// --- [4] エンコード・メイン ---
 	public static async encode(w: number, h: number, planes: Int32Array[]): Promise<Blob> {
-		const cols = Math.ceil(w / this.TILE_SIZE),
-			rows = Math.ceil(h / this.TILE_SIZE);
+		const len = w * h;
+		const resY = new Int32Array(len);
+		const resCo = new Int32Array(len);
+		const resCg = new Int32Array(len);
 
-		// 【改善案 2】可変長メタデータの格納リスト
-		const metaList: number[] = [];
-		const packedDataList: Int32Array[] = [];
+		const yPlane = planes[0];
+		const coPlane = planes[1];
+		const cgPlane = planes[2];
 
-		for (let r = 0; r < rows; r++) {
-			for (let c = 0; c < cols; c++) {
-				const tx = c * this.TILE_SIZE,
-					ty = r * this.TILE_SIZE;
-				const tw = Math.min(this.TILE_SIZE, w - tx),
-					th = Math.min(this.TILE_SIZE, h - ty);
-				const tileLen = tw * th;
-				const tY = new Int32Array(tileLen),
-					tCo = new Int32Array(tileLen),
-					tCg = new Int32Array(tileLen);
+		// 1. DPCM 予測 (画像全体に対して MED 予測を行い、残差を求める)
+		// タイル分割を撤廃し、GZIPが長距離相関を見つけやすくする
+		for (let y = 0; y < h; y++) {
+			const rowOffset = y * w;
+			for (let x = 0; x < w; x++) {
+				const i = rowOffset + x;
 
-				for (let y = 0; y < th; y++) {
-					for (let x = 0; x < tw; x++) {
-						const idx = (ty + y) * w + (tx + x),
-							tidx = y * tw + x;
-						tY[tidx] = planes[0][idx];
-						tCo[tidx] = planes[1][idx];
-						tCg[tidx] = planes[2][idx];
-					}
-				}
+				const leftY = x > 0 ? yPlane[i - 1] : y > 0 ? yPlane[i - w] : 0;
+				const topY = y > 0 ? yPlane[i - w] : leftY;
+				const topLeftY = x > 0 && y > 0 ? yPlane[i - w - 1] : topY;
+				resY[i] = yPlane[i] - this.med(leftY, topY, topLeftY);
 
-				// 最適な構成を探索 (Level & Paeth)
-				let bestScore = Infinity,
-					bestL = 0,
-					bestP = false;
-				for (let l = 0; l <= 3; l++) {
-					if (tw >> l < 2 || th >> l < 2) break;
-					for (const p of [true, false]) {
-						const test = new Int32Array(tY);
-						for (let i = 0; i < l; i++) this.iwt2D(test, tw >> i, th >> i, tw, false);
-						if (p) this.applyPaeth(test, tw >> l, th >> l, tw, false);
-						const score = this.calcEntropy(test);
-						if (score < bestScore) {
-							bestScore = score;
-							bestL = l;
-							bestP = p;
-						}
-					}
-				}
+				const leftCo = x > 0 ? coPlane[i - 1] : y > 0 ? coPlane[i - w] : 0;
+				const topCo = y > 0 ? coPlane[i - w] : leftCo;
+				const topLeftCo = x > 0 && y > 0 ? coPlane[i - w - 1] : topCo;
+				resCo[i] = coPlane[i] - this.med(leftCo, topCo, topLeftCo);
 
-				// 実際の変換
-				for (let i = 0; i < bestL; i++) {
-					this.iwt2D(tY, tw >> i, th >> i, tw, false);
-					this.iwt2D(tCo, tw >> i, th >> i, tw, false);
-					this.iwt2D(tCg, tw >> i, th >> i, tw, false);
-				}
-				if (bestP) {
-					this.applyPaeth(tY, tw >> bestL, th >> bestL, tw, false);
-					this.applyPaeth(tCo, tw >> bestL, th >> bestL, tw, false);
-					this.applyPaeth(tCg, tw >> bestL, th >> bestL, tw, false);
-				}
-
-				// CfL 予測
-				const aCo = this.calcAlpha(tY, tCo),
-					aCg = this.calcAlpha(tY, tCg);
-				this.applyAlpha(tY, tCo, aCo, false);
-				this.applyAlpha(tY, tCg, aCg, false);
-
-				// パッキングとメタデータ圧縮
-				const isEmpty = [tY, tCo, tCg].every((a) => a.every((v) => v === 0));
-
-				let flags = bestL | (bestP ? 0x40 : 0) | (isEmpty ? 0x80 : 0);
-				if (!isEmpty && aCo !== 0) flags |= 0x10;
-				if (!isEmpty && aCg !== 0) flags |= 0x20;
-
-				metaList.push(flags);
-
-				if (!isEmpty) {
-					if (aCo !== 0) metaList.push(aCo & 0xff);
-					if (aCg !== 0) metaList.push(aCg & 0xff);
-
-					// サブバンドごとに整理してからプッシュする
-					packedDataList.push(this.collectSubbands(tY, tw, th, bestL));
-					packedDataList.push(this.collectSubbands(tCo, tw, th, bestL));
-					packedDataList.push(this.collectSubbands(tCg, tw, th, bestL));
-				}
+				const leftCg = x > 0 ? cgPlane[i - 1] : y > 0 ? cgPlane[i - w] : 0;
+				const topCg = y > 0 ? cgPlane[i - w] : leftCg;
+				const topLeftCg = x > 0 && y > 0 ? cgPlane[i - w - 1] : topCg;
+				resCg[i] = cgPlane[i] - this.med(leftCg, topCg, topLeftCg);
 			}
 		}
 
-		// シリアライズ
-		const totalDataLen = packedDataList.reduce((acc, a) => acc + a.length, 0);
-		const combinedData = new Int32Array(totalDataLen);
-		let offset = 0;
-		for (const arr of packedDataList) {
-			combinedData.set(arr, offset);
-			offset += arr.length;
+		// 2. クロスカラー相関予測の全体最適化
+		// Yの残差変動から、Co, Cg の残差変動を線形回帰的に予測してさらに削る
+		let sY2 = 0,
+			sYCo = 0,
+			sYCg = 0;
+		for (let i = 0; i < len; i++) {
+			sY2 += resY[i] * resY[i];
+			sYCo += resY[i] * resCo[i];
+			sYCg += resY[i] * resCg[i];
+		}
+		// 係数 alpha は 5bit シフト (-128 ~ 127) に収める
+		const alphaCo = sY2 === 0 ? 0 : Math.max(-128, Math.min(127, Math.round((sYCo / sY2) * 32)));
+		const alphaCg = sY2 === 0 ? 0 : Math.max(-128, Math.min(127, Math.round((sYCg / sY2) * 32)));
+
+		if (alphaCo !== 0 || alphaCg !== 0) {
+			for (let i = 0; i < len; i++) {
+				resCo[i] -= (resY[i] * alphaCo) >> 5;
+				resCg[i] -= (resY[i] * alphaCg) >> 5;
+			}
 		}
 
-		// ヘッダーを16バイトに拡張し、メタデータの長さを記録する
-		const header = new DataView(new ArrayBuffer(16));
+		// 3. 【究極のズル】GZIPを極限まで騙すプレーン分離パッキング
+		// Int32配列をそのまま投げると上位バイトの"0"がLZ77辞書を無駄に消費する。
+		// そこで、下位8ビットと上位ビットを完全に分離し、種類ごとに固めて配置する。
+		const lowY = new Uint8Array(len);
+		const lowCo = new Uint8Array(len);
+		const lowCg = new Uint8Array(len);
+
+		const highY: number[] = [];
+		const highCo: number[] = [];
+		const highCg: number[] = [];
+
+		const flagBytes = Math.ceil(len / 8);
+		const highFlagY = new Uint8Array(flagBytes);
+		const highFlagCo = new Uint8Array(flagBytes);
+		const highFlagCg = new Uint8Array(flagBytes);
+
+		for (let i = 0; i < len; i++) {
+			const zy = this.zigzag(resY[i]);
+			lowY[i] = zy & 0xff;
+			if (zy > 0xff) {
+				highFlagY[i >> 3] |= 1 << (i & 7);
+				highY.push(zy >> 8);
+			}
+
+			const zco = this.zigzag(resCo[i]);
+			lowCo[i] = zco & 0xff;
+			if (zco > 0xff) {
+				highFlagCo[i >> 3] |= 1 << (i & 7);
+				highCo.push(zco >> 8);
+			}
+
+			const zcg = this.zigzag(resCg[i]);
+			lowCg[i] = zcg & 0xff;
+			if (zcg > 0xff) {
+				highFlagCg[i >> 3] |= 1 << (i & 7);
+				highCg.push(zcg >> 8);
+			}
+		}
+
+		// ペイロードの結合 (フラグ群 -> 上位バイト群 -> 下位バイト群 の順)
+		const payloadSize = flagBytes * 3 + highY.length + highCo.length + highCg.length + len * 3;
+		const combined = new Uint8Array(payloadSize);
+		let offset = 0;
+
+		// ほぼ全て0になるフラグはGZIPが一瞬で数バイトに圧縮する
+		combined.set(highFlagY, offset);
+		offset += flagBytes;
+		combined.set(highFlagCo, offset);
+		offset += flagBytes;
+		combined.set(highFlagCg, offset);
+		offset += flagBytes;
+
+		combined.set(new Uint8Array(highY), offset);
+		offset += highY.length;
+		combined.set(new Uint8Array(highCo), offset);
+		offset += highCo.length;
+		combined.set(new Uint8Array(highCg), offset);
+		offset += highCg.length;
+
+		// 連続した画像パターンが残る下位バイトにLZ77の辞書をフル活用させる
+		combined.set(lowY, offset);
+		offset += len;
+		combined.set(lowCo, offset);
+		offset += len;
+		combined.set(lowCg, offset);
+		offset += len;
+
+		// 4. ヘッダー構築 (28バイト)
+		const header = new DataView(new ArrayBuffer(28));
 		this.MAGIC.forEach((b, i) => header.setUint8(i, b));
 		header.setUint32(4, w);
 		header.setUint32(8, h);
-		header.setUint32(12, metaList.length);
+		header.setInt8(12, alphaCo);
+		header.setInt8(13, alphaCg);
+		header.setUint32(16, highY.length);
+		header.setUint32(20, highCo.length);
+		header.setUint32(24, highCg.length);
 
-		const tileMetas = new Uint8Array(metaList);
-		const shuffled = this.shuffle(combinedData) as Uint8Array<ArrayBuffer>;
-		const compressed = await new Response(new Blob([tileMetas, shuffled]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+		// 5. 最終GZIP圧縮
+		const compressed = await new Response(new Blob([combined]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
 		return new Blob([header, compressed]);
 	}
 
-	private static calcAlpha(Y: Int32Array, C: Int32Array): number {
-		let sY2 = 0,
-			sYC = 0;
-		for (let i = 1; i < Y.length; i++) {
-			sY2 += Y[i] * Y[i];
-			sYC += Y[i] * C[i];
-		}
-		return sY2 === 0 ? 0 : Math.max(-128, Math.min(127, Math.round((sYC / sY2) * 32)));
-	}
-
+	// --- [5] デコード・メイン ---
 	public static async decode(blob: Blob): Promise<{ w: number; h: number; planes: Int32Array[] }> {
-		const headerBuf = await blob.slice(0, 16).arrayBuffer();
+		const headerBuf = await blob.slice(0, 28).arrayBuffer();
 		const header = new DataView(headerBuf);
-		if (!this.MAGIC.every((v, i) => v === header.getUint8(i))) throw new Error("Invalid LFT file");
+		if (!this.MAGIC.every((v, i) => v === header.getUint8(i))) throw new Error("Invalid LFT Extreme file");
 
-		const w = header.getUint32(4),
-			h = header.getUint32(8),
-			metaSize = header.getUint32(12);
+		const w = header.getUint32(4);
+		const h = header.getUint32(8);
+		const alphaCo = header.getInt8(12);
+		const alphaCg = header.getInt8(13);
+		const lenY = header.getUint32(16);
+		const lenCo = header.getUint32(20);
+		const lenCg = header.getUint32(24);
 
-		const stream = blob.slice(16).stream().pipeThrough(new DecompressionStream("gzip"));
+		const stream = blob.slice(28).stream().pipeThrough(new DecompressionStream("gzip"));
 		const buf = await new Response(stream).arrayBuffer();
+		const data = new Uint8Array(buf);
 
-		const tileMetas = new Uint8Array(buf, 0, metaSize);
-		const unshuffled = this.unshuffle(new Uint8Array(buf, metaSize));
+		const len = w * h;
+		const flagBytes = Math.ceil(len / 8);
 
-		const cols = Math.ceil(w / this.TILE_SIZE),
-			rows = Math.ceil(h / this.TILE_SIZE);
-		const planes = [new Int32Array(w * h), new Int32Array(w * h), new Int32Array(w * h)];
-		let cursor = 0;
-		let metaCursor = 0;
+		let offset = 0;
+		const highFlagY = data.subarray(offset, offset + flagBytes);
+		offset += flagBytes;
+		const highFlagCo = data.subarray(offset, offset + flagBytes);
+		offset += flagBytes;
+		const highFlagCg = data.subarray(offset, offset + flagBytes);
+		offset += flagBytes;
 
-		for (let r = 0; r < rows; r++) {
-			for (let c = 0; c < cols; c++) {
-				const tx = c * this.TILE_SIZE,
-					ty = r * this.TILE_SIZE;
-				const tw = Math.min(this.TILE_SIZE, w - tx),
-					th = Math.min(this.TILE_SIZE, h - ty);
-				const tileLen = tw * th;
+		const highY = data.subarray(offset, offset + lenY);
+		offset += lenY;
+		const highCo = data.subarray(offset, offset + lenCo);
+		offset += lenCo;
+		const highCg = data.subarray(offset, offset + lenCg);
+		offset += lenCg;
 
-				const flags = tileMetas[metaCursor++];
-				const l = flags & 0x0f;
-				const hasACo = (flags & 0x10) !== 0;
-				const hasACg = (flags & 0x20) !== 0;
-				const p = (flags & 0x40) !== 0;
-				const empty = (flags & 0x80) !== 0;
+		const lowY = data.subarray(offset, offset + len);
+		offset += len;
+		const lowCo = data.subarray(offset, offset + len);
+		offset += len;
+		const lowCg = data.subarray(offset, offset + len);
+		offset += len;
 
-				let aCo = 0,
-					aCg = 0;
-				const tY = new Int32Array(tileLen),
-					tCo = new Int32Array(tileLen),
-					tCg = new Int32Array(tileLen);
+		const resY = new Int32Array(len);
+		const resCo = new Int32Array(len);
+		const resCg = new Int32Array(len);
 
-				if (!empty) {
-					if (hasACo) aCo = (tileMetas[metaCursor++] << 24) >> 24;
-					if (hasACg) aCg = (tileMetas[metaCursor++] << 24) >> 24;
+		let idxY = 0,
+			idxCo = 0,
+			idxCg = 0;
 
-					const tmpY = unshuffled.subarray(cursor, cursor + tileLen);
-					cursor += tileLen;
-					const tmpCo = unshuffled.subarray(cursor, cursor + tileLen);
-					cursor += tileLen;
-					const tmpCg = unshuffled.subarray(cursor, cursor + tileLen);
-					cursor += tileLen;
+		// プレーン分離されたデータを元の残差値(Int32)に復元
+		for (let i = 0; i < len; i++) {
+			let zy = lowY[i];
+			if ((highFlagY[i >> 3] & (1 << (i & 7))) !== 0) zy |= highY[idxY++] << 8;
+			resY[i] = this.unzigzag(zy);
 
-					// サブバンド順から元のタイル配置へ復元
-					tY.set(this.restoreSubbands(tmpY, tw, th, l));
-					tCo.set(this.restoreSubbands(tmpCo, tw, th, l));
-					tCg.set(this.restoreSubbands(tmpCg, tw, th, l));
-				}
+			let zco = lowCo[i];
+			if ((highFlagCo[i >> 3] & (1 << (i & 7))) !== 0) zco |= highCo[idxCo++] << 8;
+			resCo[i] = this.unzigzag(zco);
 
-				this.applyAlpha(tY, tCo, aCo, true);
-				this.applyAlpha(tY, tCg, aCg, true);
-				if (p) {
-					this.applyPaeth(tY, tw >> l, th >> l, tw, true);
-					this.applyPaeth(tCo, tw >> l, th >> l, tw, true);
-					this.applyPaeth(tCg, tw >> l, th >> l, tw, true);
-				}
-				for (let i = l - 1; i >= 0; i--) {
-					this.iwt2D(tY, tw >> i, th >> i, tw, true);
-					this.iwt2D(tCo, tw >> i, th >> i, tw, true);
-					this.iwt2D(tCg, tw >> i, th >> i, tw, true);
-				}
+			let zcg = lowCg[i];
+			if ((highFlagCg[i >> 3] & (1 << (i & 7))) !== 0) zcg |= highCg[idxCg++] << 8;
+			resCg[i] = this.unzigzag(zcg);
+		}
 
-				for (let y = 0; y < th; y++) {
-					for (let x = 0; x < tw; x++) {
-						const idx = (ty + y) * w + (tx + x),
-							tidx = y * tw + x;
-						planes[0][idx] = tY[tidx];
-						planes[1][idx] = tCo[tidx];
-						planes[2][idx] = tCg[tidx];
-					}
-				}
+		// クロスカラー予測の復元
+		if (alphaCo !== 0 || alphaCg !== 0) {
+			for (let i = 0; i < len; i++) {
+				resCo[i] += (resY[i] * alphaCo) >> 5;
+				resCg[i] += (resY[i] * alphaCg) >> 5;
 			}
 		}
+
+		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+		const yPlane = planes[0];
+		const coPlane = planes[1];
+		const cgPlane = planes[2];
+
+		// DPCM 残差から元のピクセル値へ復元
+		for (let y = 0; y < h; y++) {
+			const rowOffset = y * w;
+			for (let x = 0; x < w; x++) {
+				const i = rowOffset + x;
+
+				const leftY = x > 0 ? yPlane[i - 1] : y > 0 ? yPlane[i - w] : 0;
+				const topY = y > 0 ? yPlane[i - w] : leftY;
+				const topLeftY = x > 0 && y > 0 ? yPlane[i - w - 1] : topY;
+				yPlane[i] = resY[i] + this.med(leftY, topY, topLeftY);
+
+				const leftCo = x > 0 ? coPlane[i - 1] : y > 0 ? coPlane[i - w] : 0;
+				const topCo = y > 0 ? coPlane[i - w] : leftCo;
+				const topLeftCo = x > 0 && y > 0 ? coPlane[i - w - 1] : topCo;
+				coPlane[i] = resCo[i] + this.med(leftCo, topCo, topLeftCo);
+
+				const leftCg = x > 0 ? cgPlane[i - 1] : y > 0 ? cgPlane[i - w] : 0;
+				const topCg = y > 0 ? cgPlane[i - w] : leftCg;
+				const topLeftCg = x > 0 && y > 0 ? cgPlane[i - w - 1] : topCg;
+				cgPlane[i] = resCg[i] + this.med(leftCg, topCg, topLeftCg);
+			}
+		}
+
 		return { w, h, planes };
 	}
 }
@@ -486,14 +337,13 @@ document.getElementById("upload-lft")?.addEventListener("change", async (e) => {
 	}
 	const t1 = performance.now();
 
-	// --- 1ビットの誤りもないか検証 ---
 	let diffs = 0;
 	if (originalData && originalData.length === out.length) {
 		for (let i = 0; i < out.length; i++) {
 			if (originalData[i] !== out[i]) diffs++;
 		}
 	} else {
-		diffs = -1; // サイズ不一致
+		diffs = -1;
 	}
 
 	const canvas = document.getElementById("canvas-recon") as HTMLCanvasElement;
