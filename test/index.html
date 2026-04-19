@@ -12,8 +12,9 @@
 		}
 
 		.dashboard {
+			/* 4カラムに変更 */
 			display: grid;
-			grid-template-columns: repeat(3, 1fr);
+			grid-template-columns: repeat(4, 1fr);
 			gap: 15px;
 			margin-bottom: 20px;
 		}
@@ -91,15 +92,19 @@
 
 	<div class="dashboard">
 		<div class="card">
-			<h4>Raw Data</h4>
+			<h4>File Size (PNG/JPG)</h4>
+			<div id="stat-file-size" class="val">-</div>
+		</div>
+		<div class="card">
+			<h4>Raw Pixels</h4>
 			<div id="stat-orig-size" class="val">-</div>
 		</div>
 		<div class="card">
-			<h4>Compressed</h4>
+			<h4>Compressed (LFT)</h4>
 			<div id="stat-comp-size" class="val">-</div>
 		</div>
 		<div class="card">
-			<h4>Efficiency</h4>
+			<h4>Efficiency (vs Raw)</h4>
 			<div id="stat-ratio" class="val">-</div>
 		</div>
 	</div>
@@ -123,5 +128,6 @@
 	</div>
 
 	<script src="../dist/LFT.js"></script>
+	<script src="main.js"></script>
 </body>
 </html>
