@@ -17,147 +17,203 @@ class LFT {
 		return [r, g, b];
 	}
 
-	// --- 高度なビットストリーム・ライター ---
-	private static bitBuffer = new Uint8Array(0);
-	private static bytePos = 0;
-	private static bitPos = 0;
-
-	private static initWrite(size: number) {
-		this.bitBuffer = new Uint8Array(size);
-		this.bytePos = 0;
-		this.bitPos = 0;
+	// Paeth予測器: JPEG-LS等で使われるより高度な予測
+	private static paeth(a: number, b: number, c: number): number {
+		const p = a + b - c;
+		const pa = Math.abs(p - a);
+		const pb = Math.abs(p - b);
+		const pc = Math.abs(p - c);
+		if (pa <= pb && pa <= pc) return a;
+		if (pb <= pc) return b;
+		return c;
 	}
 
-	private static writeBit(bit: number) {
-		if (bit) this.bitBuffer[this.bytePos] |= 1 << (7 - this.bitPos);
-		if (++this.bitPos === 8) {
-			this.bitPos = 0;
-			this.bytePos++;
-		}
+	private static zigzag(v: number): number {
+		return (v << 1) ^ (v >> 31);
+	}
+	private static unzigzag(v: number): number {
+		return (v >>> 1) ^ -(v & 1);
 	}
 
-	private static writeBits(val: number, len: number) {
-		for (let i = len - 1; i >= 0; i--) this.writeBit((val >> i) & 1);
-	}
+	// --- 算術符号化エンジン (整数実装) ---
+	private static readonly TOP_VALUE = 0xffffffff;
+	private static readonly FIRST_QUARTER = 0x40000000;
+	private static readonly HALF = 0x80000000;
+	private static readonly THIRD_QUARTER = 0xc0000000;
 
-	private static writeRice(val: number, k: number) {
-		const q = val >> k;
-		for (let i = 0; i < q; i++) this.writeBit(1);
-		this.writeBit(0);
-		this.writeBits(val & ((1 << k) - 1), k);
-	}
-
-	// --- 高度な予測と符号化エンジン ---
 	public static async encode(w: number, h: number, planes: Int32Array[]): Promise<Blob> {
-		this.initWrite(w * h * 4);
-		const len = w * h;
+		const output = new Uint8Array(w * h * 4); // 十分なバッファ
+		let op = 0;
+		let low = 0,
+			high = this.TOP_VALUE,
+			bits_to_follow = 0;
+
+		const writeByte = (b: number) => {
+			output[op++] = b;
+		};
+		const outBit = (bit: number) => {
+			currentByte = (currentByte << 1) | bit;
+			if (++bitCount === 8) {
+				writeByte(currentByte);
+				bitCount = 0;
+				currentByte = 0;
+			}
+		};
+		const outBitWithFollow = (bit: number) => {
+			outBit(bit);
+			for (; bits_to_follow > 0; bits_to_follow--) outBit(bit ^ 1);
+		};
+
+		let bitCount = 0,
+			currentByte = 0;
+
+		// コンテキスト別の頻度表 (3コンテキスト × 512シンボル)
+		const freqs = Array.from({ length: 3 }, () => new Uint32Array(513).fill(1));
+		const sums = new Uint32Array(3).fill(512);
 
 		for (let p = 0; p < 3; p++) {
 			const data = planes[p];
-			// コンテキスト学習用：平均絶対誤差を追跡
-			let sumError = 128;
-			let count = 1;
+			let lastErr = 0;
 
 			for (let y = 0; y < h; y++) {
-				const off = y * w;
 				for (let x = 0; x < w; x++) {
-					const i = off + x;
+					const i = y * w + x;
 					const a = x > 0 ? data[i - 1] : y > 0 ? data[i - w] : 0;
 					const b = y > 0 ? data[i - w] : a;
 					const c = x > 0 && y > 0 ? data[i - w - 1] : b;
 
-					// MED予測器
-					let pred = 0;
-					if (c >= Math.max(a, b)) pred = Math.min(a, b);
-					else if (c <= Math.min(a, b)) pred = Math.max(a, b);
-					else pred = a + b - c;
+					const pred = this.paeth(a, b, c);
+					const zz = this.zigzag(data[i] - pred);
 
-					const diff = data[i] - pred;
-					const zz = (diff << 1) ^ (diff >> 31);
+					// 直前の誤差の大きさでコンテキストを選択
+					const ctx = lastErr < 2 ? 0 : lastErr < 8 ? 1 : 2;
+					lastErr = zz;
 
-					// 適応型 Rice パラメータ k の算出 (k = log2(mean_error))
-					let k = 0;
-					while (count << k < sumError) k++;
+					const f = freqs[ctx];
+					let cum = 0;
+					for (let j = 0; j < zz; j++) cum += f[j];
 
-					this.writeRice(zz, k);
+					const range = high - low + 1;
+					high = low + Math.floor((range * (cum + f[zz])) / sums[ctx]) - 1;
+					low = low + Math.floor((range * cum) / sums[ctx]);
 
-					// 統計の更新 (スライディングウィンドウ的な重み付け)
-					sumError += zz;
-					count++;
-					if (count > 64) {
-						sumError >>= 1;
-						count >>= 1;
+					while (true) {
+						if (high < this.HALF) outBitWithFollow(0);
+						else if (low >= this.HALF) {
+							outBitWithFollow(1);
+							low -= this.HALF;
+							high -= this.HALF;
+						} else if (low >= this.FIRST_QUARTER && high < this.THIRD_QUARTER) {
+							bits_to_follow++;
+							low -= this.FIRST_QUARTER;
+							high -= this.FIRST_QUARTER;
+						} else break;
+						low = (low << 1) >>> 0;
+						high = ((high << 1) | 1) >>> 0;
+					}
+
+					// 頻度の更新
+					f[zz]++;
+					sums[ctx]++;
+					if (sums[ctx] > 16384) {
+						// 定期的にスケーリングして適応性を維持
+						for (let j = 0; j < 513; j++) f[j] = (f[j] >> 1) | 1;
+						let s = 0;
+						for (let j = 0; j < 512; j++) s += f[j];
+						sums[ctx] = s;
 					}
 				}
 			}
 		}
+		// 終了フラッシュ
+		bits_to_follow++;
+		if (low < this.FIRST_QUARTER) outBitWithFollow(0);
+		else outBitWithFollow(1);
+		if (bitCount > 0) writeByte(currentByte << (8 - bitCount));
 
 		const header = new DataView(new ArrayBuffer(12));
 		this.MAGIC.forEach((b, i) => header.setUint8(i, b));
 		header.setUint32(4, w);
 		header.setUint32(8, h);
-		return new Blob([header, this.bitBuffer.slice(0, this.bytePos + 1)]);
+		return new Blob([header, output.slice(0, op)]);
 	}
 
 	public static async decode(blob: Blob): Promise<{ w: number; h: number; planes: Int32Array[] }> {
-		const buf = new Uint8Array(await blob.arrayBuffer());
-		const dv = new DataView(buf.buffer);
+		const arrayBuf = await blob.arrayBuffer();
+		const buf = new Uint8Array(arrayBuf);
+		const dv = new DataView(arrayBuf);
 		const w = dv.getUint32(4),
 			h = dv.getUint32(8);
 		const len = w * h;
 
-		let bytePos = 12,
-			bitPos = 0;
+		let bp = 12,
+			bitIdx = 0;
 		const readBit = () => {
-			const bit = (buf[bytePos] >> (7 - bitPos)) & 1;
-			if (++bitPos === 8) {
-				bitPos = 0;
-				bytePos++;
+			const b = (buf[bp] >> (7 - bitIdx)) & 1;
+			if (++bitIdx === 8) {
+				bitIdx = 0;
+				bp++;
 			}
-			return bit;
-		};
-		const readBits = (len: number) => {
-			let val = 0;
-			for (let i = 0; i < len; i++) val = (val << 1) | readBit();
-			return val;
-		};
-		const readRice = (k: number) => {
-			let q = 0;
-			while (readBit() === 1) q++;
-			return (q << k) | readBits(k);
+			return b;
 		};
 
+		let low = 0,
+			high = this.TOP_VALUE,
+			value = 0;
+		for (let i = 0; i < 32; i++) value = ((value << 1) | readBit()) >>> 0;
+
+		const freqs = Array.from({ length: 3 }, () => new Uint32Array(513).fill(1));
+		const sums = new Uint32Array(3).fill(512);
 		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+
 		for (let p = 0; p < 3; p++) {
 			const out = planes[p];
-			let sumError = 128,
-				count = 1;
+			let lastErr = 0;
+			for (let i = 0; i < len; i++) {
+				const x = i % w,
+					y = Math.floor(i / w);
+				const a = x > 0 ? out[i - 1] : y > 0 ? out[i - w] : 0;
+				const b = y > 0 ? out[i - w] : a;
+				const c = x > 0 && y > 0 ? out[i - w - 1] : b;
+				const pred = this.paeth(a, b, c);
 
-			for (let y = 0; y < h; y++) {
-				for (let x = 0; x < w; x++) {
-					const i = y * w + x;
-					const a = x > 0 ? out[i - 1] : y > 0 ? out[i - w] : 0;
-					const b = y > 0 ? out[i - w] : a;
-					const c = x > 0 && y > 0 ? out[i - w - 1] : b;
+				const ctx = lastErr < 2 ? 0 : lastErr < 8 ? 1 : 2;
+				const f = freqs[ctx];
+				const range = high - low + 1;
+				const count = Math.floor(((value - low + 1) * sums[ctx] - 1) / range);
 
-					let pred = 0;
-					if (c >= Math.max(a, b)) pred = Math.min(a, b);
-					else if (c <= Math.min(a, b)) pred = Math.max(a, b);
-					else pred = a + b - c;
+				let zz = 0,
+					cum = 0;
+				while (cum + f[zz] <= count) cum += f[zz++];
 
-					let k = 0;
-					while (count << k < sumError) k++;
+				high = low + Math.floor((range * (cum + f[zz])) / sums[ctx]) - 1;
+				low = low + Math.floor((range * cum) / sums[ctx]);
 
-					const zz = readRice(k);
-					const diff = (zz >>> 1) ^ -(zz & 1);
-					out[i] = pred + diff;
+				while (true) {
+					if (high < this.HALF) {
+					} else if (low >= this.HALF) {
+						low -= this.HALF;
+						high -= this.HALF;
+						value -= this.HALF;
+					} else if (low >= this.FIRST_QUARTER && high < this.THIRD_QUARTER) {
+						low -= this.FIRST_QUARTER;
+						high -= this.FIRST_QUARTER;
+						value -= this.FIRST_QUARTER;
+					} else break;
+					low = (low << 1) >>> 0;
+					high = ((high << 1) | 1) >>> 0;
+					value = ((value << 1) | readBit()) >>> 0;
+				}
 
-					sumError += zz;
-					count++;
-					if (count > 64) {
-						sumError >>= 1;
-						count >>= 1;
-					}
+				out[i] = pred + this.unzigzag(zz);
+				lastErr = zz;
+				f[zz]++;
+				sums[ctx]++;
+				if (sums[ctx] > 16384) {
+					for (let j = 0; j < 513; j++) f[j] = (f[j] >> 1) | 1;
+					let s = 0;
+					for (let j = 0; j < 512; j++) s += f[j];
+					sums[ctx] = s;
 				}
 			}
 		}
