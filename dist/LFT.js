@@ -22,10 +22,9 @@ var LFT = class {
     const r = b + co;
     return [r, g, b];
   }
-  // Gradient Adaptive Predictor (GAP) - CALIC等で採用される高精度予測
   static gap(x, y, w, data) {
     const i = y * w + x;
-    const n = y > 0 ? data[i - w] : 0;
+    const n = y > 0 ? data[i - w] : 128;
     const w_ = x > 0 ? data[i - 1] : n;
     const ne = y > 0 && x < w - 1 ? data[i - w + 1] : n;
     const nw = y > 0 && x > 0 ? data[i - w - 1] : n;
@@ -46,12 +45,22 @@ var LFT = class {
   static unzigzag(v) {
     return v >>> 1 ^ -(v & 1);
   }
-  // --- 算術符号化定数 ---
-  static RANGE_MAX = 4294967295;
-  static HALF = 2147483648;
-  static QUARTER = 1073741824;
-  static async encode(w, h, planes) {
-    const output = new Uint8Array(w * h * 4);
+  // 30-bit range coder for stability in JS
+  static RANGE_MAX = 1073741823;
+  static HALF = 536870912;
+  static QUARTER = 268435456;
+  static MODEL_SIZE = 1024;
+  static async encode(w, h, rgba) {
+    const len = w * h;
+    const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+    for (let i = 0; i < len; i++) {
+      const [y, co, cg] = this.rgbToYCoCgR(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+      planes[0][i] = y;
+      planes[1][i] = co;
+      planes[2][i] = cg;
+      planes[3][i] = rgba[i * 4 + 3];
+    }
+    const output = new Uint8Array(len * 5 + 12);
     let op = 0, low = 0, high = this.RANGE_MAX, underflow = 0;
     let currentByte = 0, bitCount = 0;
     const putBit = (bit) => {
@@ -66,21 +75,23 @@ var LFT = class {
       putBit(bit);
       for (; underflow > 0; underflow--) putBit(bit ^ 1);
     };
-    const models = Array.from({ length: 3 }, () => {
-      const f = new Uint32Array(513).fill(1);
-      return { f, sum: 512 };
+    const models = Array.from({ length: 4 }, () => {
+      const f = new Uint32Array(this.MODEL_SIZE + 1).fill(1);
+      return { f, sum: this.MODEL_SIZE };
     });
-    for (let p = 0; p < 3; p++) {
+    for (let p = 0; p < 4; p++) {
       const data = planes[p];
       const model = models[p];
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
-          const zz = this.zigzag(data[y * w + x] - Math.round(this.gap(x, y, w, data)));
+          let zz = this.zigzag(data[y * w + x] - Math.round(this.gap(x, y, w, data)));
+          if (zz >= this.MODEL_SIZE) zz = this.MODEL_SIZE - 1;
           const range = high - low + 1;
           let cum = 0;
           for (let j = 0; j < zz; j++) cum += model.f[j];
+          const next_low = low + Math.floor(range * cum / model.sum);
           high = low + Math.floor(range * (cum + model.f[zz]) / model.sum) - 1;
-          low = low + Math.floor(range * cum / model.sum);
+          low = next_low;
           while (true) {
             if (high < this.HALF) applyBit(0);
             else if (low >= this.HALF) {
@@ -99,7 +110,7 @@ var LFT = class {
           model.sum += 8;
           if (model.sum > 32768) {
             model.sum = 0;
-            for (let j = 0; j < 513; j++) {
+            for (let j = 0; j < this.MODEL_SIZE; j++) {
               model.f[j] = model.f[j] >> 1 | 1;
               model.sum += model.f[j];
             }
@@ -107,18 +118,19 @@ var LFT = class {
         }
       }
     }
-    applyBit(1);
+    applyBit(low >= this.QUARTER ? 1 : 0);
     if (bitCount > 0) output[op++] = currentByte << 8 - bitCount;
     const head = new DataView(new ArrayBuffer(12));
     this.MAGIC.forEach((b, i) => head.setUint8(i, b));
     head.setUint32(4, w);
     head.setUint32(8, h);
-    return new Blob([head, output.slice(0, op)]);
+    return new Blob([head, output.subarray(0, op)]);
   }
   static async decode(blob) {
     const ab = await blob.arrayBuffer();
+    const dv = new DataView(ab);
+    const w = dv.getUint32(4), h = dv.getUint32(8);
     const buf = new Uint8Array(ab);
-    const w = new DataView(ab).getUint32(4), h = new DataView(ab).getUint32(8);
     const len = w * h;
     let bp = 12, bitIdx = 0;
     const getBit = () => {
@@ -131,13 +143,13 @@ var LFT = class {
       return b;
     };
     let low = 0, high = this.RANGE_MAX, val = 0;
-    for (let i = 0; i < 32; i++) val = (val << 1 | getBit()) >>> 0;
-    const models = Array.from({ length: 3 }, () => {
-      const f = new Uint32Array(513).fill(1);
-      return { f, sum: 512 };
+    for (let i = 0; i < 30; i++) val = (val << 1 | getBit()) >>> 0;
+    const models = Array.from({ length: 4 }, () => {
+      const f = new Uint32Array(this.MODEL_SIZE + 1).fill(1);
+      return { f, sum: this.MODEL_SIZE };
     });
-    const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len)];
-    for (let p = 0; p < 3; p++) {
+    const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+    for (let p = 0; p < 4; p++) {
       const out = planes[p];
       const model = models[p];
       for (let y = 0; y < h; y++) {
@@ -146,8 +158,9 @@ var LFT = class {
           const count = Math.floor(((val - low + 1) * model.sum - 1) / range);
           let zz = 0, tmpCum = 0;
           while (tmpCum + model.f[zz] <= count) tmpCum += model.f[zz++];
+          const next_low = low + Math.floor(range * tmpCum / model.sum);
           high = low + Math.floor(range * (tmpCum + model.f[zz]) / model.sum) - 1;
-          low = low + Math.floor(range * tmpCum / model.sum);
+          low = next_low;
           while (true) {
             if (high < this.HALF) {
             } else if (low >= this.HALF) {
@@ -168,7 +181,7 @@ var LFT = class {
           model.sum += 8;
           if (model.sum > 32768) {
             model.sum = 0;
-            for (let j = 0; j < 513; j++) {
+            for (let j = 0; j < this.MODEL_SIZE; j++) {
               model.f[j] = model.f[j] >> 1 | 1;
               model.sum += model.f[j];
             }
@@ -176,7 +189,18 @@ var LFT = class {
         }
       }
     }
-    return { w, h, planes };
+    const rgba = new Uint8Array(len * 4);
+    for (let i = 0; i < len; i++) {
+      const [r, g, b] = this.yCoCgRToRgb(planes[0][i], planes[1][i], planes[2][i]);
+      rgba[i * 4] = Math.max(0, Math.min(255, r));
+      rgba[i * 4 + 1] = Math.max(0, Math.min(255, g));
+      rgba[i * 4 + 2] = Math.max(0, Math.min(255, b));
+      rgba[i * 4 + 3] = Math.max(0, Math.min(255, planes[3][i]));
+    }
+    return { w, h, data: rgba };
   }
+};
+export {
+  LFT
 };
 //# sourceMappingURL=LFT.js.map

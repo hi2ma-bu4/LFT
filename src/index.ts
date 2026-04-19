@@ -1,7 +1,7 @@
-class LFT {
+export class LFT {
 	private static readonly MAGIC = new Uint8Array([76, 70, 84, 33]);
 
-	public static rgbToYCoCgR(r: number, g: number, b: number): [number, number, number] {
+	private static rgbToYCoCgR(r: number, g: number, b: number): [number, number, number] {
 		const co = r - b;
 		const tmp = b + (co >> 1);
 		const cg = g - tmp;
@@ -9,7 +9,7 @@ class LFT {
 		return [y, co, cg];
 	}
 
-	public static yCoCgRToRgb(y: number, co: number, cg: number): [number, number, number] {
+	private static yCoCgRToRgb(y: number, co: number, cg: number): [number, number, number] {
 		const tmp = y - (cg >> 1);
 		const g = cg + tmp;
 		const b = tmp - (co >> 1);
@@ -17,10 +17,9 @@ class LFT {
 		return [r, g, b];
 	}
 
-	// Gradient Adaptive Predictor (GAP) - CALIC等で採用される高精度予測
 	private static gap(x: number, y: number, w: number, data: Int32Array): number {
 		const i = y * w + x;
-		const n = y > 0 ? data[i - w] : 0;
+		const n = y > 0 ? data[i - w] : 128;
 		const w_ = x > 0 ? data[i - 1] : n;
 		const ne = y > 0 && x < w - 1 ? data[i - w + 1] : n;
 		const nw = y > 0 && x > 0 ? data[i - w - 1] : n;
@@ -30,12 +29,12 @@ class LFT {
 		const dh = Math.abs(w_ - ww) + Math.abs(n - nw) + Math.abs(n - ne);
 		const dv = Math.abs(w_ - nw) + Math.abs(n - nn) + Math.abs(ne - (y > 1 && x < w - 1 ? data[i - 2 * w + 1] : ne));
 
-		if (dv - dh > 80) return w_; // 強い水平エッジ
-		if (dh - dv > 80) return n; // 強い垂直エッジ
+		if (dv - dh > 80) return w_;
+		if (dh - dv > 80) return n;
 
 		let pred = (w_ + n) / 2 + (ne - nw) / 4;
-		if (dv - dh > 32) return (pred + w_) / 2; // 弱い水平エッジ
-		if (dh - dv > 32) return (pred + n) / 2; // 弱い垂直エッジ
+		if (dv - dh > 32) return (pred + w_) / 2;
+		if (dh - dv > 32) return (pred + n) / 2;
 		return pred;
 	}
 
@@ -46,13 +45,25 @@ class LFT {
 		return (v >>> 1) ^ -(v & 1);
 	}
 
-	// --- 算術符号化定数 ---
-	private static readonly RANGE_MAX = 0xffffffff;
-	private static readonly HALF = 0x80000000;
-	private static readonly QUARTER = 0x40000000;
+	// 30-bit range coder for stability in JS
+	private static readonly RANGE_MAX = 0x3fffffff;
+	private static readonly HALF = 0x20000000;
+	private static readonly QUARTER = 0x10000000;
+	private static readonly MODEL_SIZE = 1024;
 
-	public static async encode(w: number, h: number, planes: Int32Array[]): Promise<Blob> {
-		const output = new Uint8Array(w * h * 4);
+	public static async encode(w: number, h: number, rgba: Uint8Array): Promise<Blob> {
+		const len = w * h;
+		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+
+		for (let i = 0; i < len; i++) {
+			const [y, co, cg] = this.rgbToYCoCgR(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+			planes[0][i] = y;
+			planes[1][i] = co;
+			planes[2][i] = cg;
+			planes[3][i] = rgba[i * 4 + 3];
+		}
+
+		const output = new Uint8Array(len * 5 + 12);
 		let op = 0,
 			low = 0,
 			high = this.RANGE_MAX,
@@ -73,27 +84,26 @@ class LFT {
 			for (; underflow > 0; underflow--) putBit(bit ^ 1);
 		};
 
-		// コンテキストモデル: 0-511の各値に対する累積頻度
-		// WebP2の性能に近づけるため、コンテキストを細分化（輝度Yと色差Co/Cgで分離）
-		const models = Array.from({ length: 3 }, () => {
-			const f = new Uint32Array(513).fill(1);
-			return { f, sum: 512 };
+		const models = Array.from({ length: 4 }, () => {
+			const f = new Uint32Array(this.MODEL_SIZE + 1).fill(1);
+			return { f, sum: this.MODEL_SIZE };
 		});
 
-		for (let p = 0; p < 3; p++) {
+		for (let p = 0; p < 4; p++) {
 			const data = planes[p];
 			const model = models[p];
-
 			for (let y = 0; y < h; y++) {
 				for (let x = 0; x < w; x++) {
-					const zz = this.zigzag(data[y * w + x] - Math.round(this.gap(x, y, w, data)));
+					let zz = this.zigzag(data[y * w + x] - Math.round(this.gap(x, y, w, data)));
+					if (zz >= this.MODEL_SIZE) zz = this.MODEL_SIZE - 1;
 
 					const range = high - low + 1;
 					let cum = 0;
 					for (let j = 0; j < zz; j++) cum += model.f[j];
 
+					const next_low = low + Math.floor((range * cum) / model.sum);
 					high = low + Math.floor((range * (cum + model.f[zz])) / model.sum) - 1;
-					low = low + Math.floor((range * cum) / model.sum);
+					low = next_low;
 
 					while (true) {
 						if (high < this.HALF) applyBit(0);
@@ -110,11 +120,11 @@ class LFT {
 						high = ((high << 1) | 1) >>> 0;
 					}
 
-					model.f[zz] += 8; // 頻度を強めに更新
+					model.f[zz] += 8;
 					model.sum += 8;
 					if (model.sum > 32768) {
 						model.sum = 0;
-						for (let j = 0; j < 513; j++) {
+						for (let j = 0; j < this.MODEL_SIZE; j++) {
 							model.f[j] = (model.f[j] >> 1) | 1;
 							model.sum += model.f[j];
 						}
@@ -122,21 +132,23 @@ class LFT {
 				}
 			}
 		}
-		applyBit(1); // 終了
+		// Flush
+		applyBit(low >= this.QUARTER ? 1 : 0);
 		if (bitCount > 0) output[op++] = currentByte << (8 - bitCount);
 
 		const head = new DataView(new ArrayBuffer(12));
 		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
 		head.setUint32(4, w);
 		head.setUint32(8, h);
-		return new Blob([head, output.slice(0, op)]);
+		return new Blob([head, output.subarray(0, op)]);
 	}
 
-	public static async decode(blob: Blob): Promise<{ w: number; h: number; planes: Int32Array[] }> {
+	public static async decode(blob: Blob): Promise<{ w: number; h: number; data: Uint8Array }> {
 		const ab = await blob.arrayBuffer();
+		const dv = new DataView(ab);
+		const w = dv.getUint32(4),
+			h = dv.getUint32(8);
 		const buf = new Uint8Array(ab);
-		const w = new DataView(ab).getUint32(4),
-			h = new DataView(ab).getUint32(8);
 		const len = w * h;
 
 		let bp = 12,
@@ -154,15 +166,15 @@ class LFT {
 		let low = 0,
 			high = this.RANGE_MAX,
 			val = 0;
-		for (let i = 0; i < 32; i++) val = ((val << 1) | getBit()) >>> 0;
+		for (let i = 0; i < 30; i++) val = ((val << 1) | getBit()) >>> 0;
 
-		const models = Array.from({ length: 3 }, () => {
-			const f = new Uint32Array(513).fill(1);
-			return { f, sum: 512 };
+		const models = Array.from({ length: 4 }, () => {
+			const f = new Uint32Array(this.MODEL_SIZE + 1).fill(1);
+			return { f, sum: this.MODEL_SIZE };
 		});
 
-		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len)];
-		for (let p = 0; p < 3; p++) {
+		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+		for (let p = 0; p < 4; p++) {
 			const out = planes[p];
 			const model = models[p];
 			for (let y = 0; y < h; y++) {
@@ -174,8 +186,9 @@ class LFT {
 						tmpCum = 0;
 					while (tmpCum + model.f[zz] <= count) tmpCum += model.f[zz++];
 
+					const next_low = low + Math.floor((range * tmpCum) / model.sum);
 					high = low + Math.floor((range * (tmpCum + model.f[zz])) / model.sum) - 1;
-					low = low + Math.floor((range * tmpCum) / model.sum);
+					low = next_low;
 
 					while (true) {
 						if (high < this.HALF) {
@@ -198,7 +211,7 @@ class LFT {
 					model.sum += 8;
 					if (model.sum > 32768) {
 						model.sum = 0;
-						for (let j = 0; j < 513; j++) {
+						for (let j = 0; j < this.MODEL_SIZE; j++) {
 							model.f[j] = (model.f[j] >> 1) | 1;
 							model.sum += model.f[j];
 						}
@@ -206,6 +219,15 @@ class LFT {
 				}
 			}
 		}
-		return { w, h, planes };
+
+		const rgba = new Uint8Array(len * 4);
+		for (let i = 0; i < len; i++) {
+			const [r, g, b] = this.yCoCgRToRgb(planes[0][i], planes[1][i], planes[2][i]);
+			rgba[i * 4] = Math.max(0, Math.min(255, r));
+			rgba[i * 4 + 1] = Math.max(0, Math.min(255, g));
+			rgba[i * 4 + 2] = Math.max(0, Math.min(255, b));
+			rgba[i * 4 + 3] = Math.max(0, Math.min(255, planes[3][i]));
+		}
+		return { w, h, data: rgba };
 	}
 }

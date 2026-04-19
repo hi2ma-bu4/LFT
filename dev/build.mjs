@@ -44,8 +44,12 @@ const ESBUILD_COMMON = {
 	outdir: DIST_DIR,
 	bundle: true,
 
-	/* ESM / browser 前提 */
-	format: "esm",
+	/* IIFE / browser 前提 */
+	format: "iife",
+	globalName: "LFT_MODULE",
+	footer: {
+		js: "window.LFT = LFT_MODULE.LFT;",
+	},
 	platform: "browser",
 	target: "es2024",
 

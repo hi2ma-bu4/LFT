@@ -7,10 +7,15 @@
   "type": "module",
   "main": "src/codec.ts",
   "scripts": {
-    "build": "node dev/build.mjs"
+    "build": "node dev/build.mjs",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "esbuild": "^0.28.0"
+    "@types/node": "^25.6.0",
+    "@types/pngjs": "^6.0.5",
+    "esbuild": "^0.28.0",
+    "pngjs": "^7.0.0",
+    "vitest": "^4.1.4"
   },
   "volta": {
     "node": "24.15.0",

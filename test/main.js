@@ -17,18 +17,11 @@ document.getElementById("upload")?.addEventListener("change", async (e) => {
 	canvas.width = w;
 	canvas.height = h;
 	ctx.drawImage(img, 0, 0);
-	originalData = ctx.getImageData(0, 0, w, h).data;
-
-	const planes = [new Int32Array(w * h), new Int32Array(w * h), new Int32Array(w * h)];
-	for (let i = 0; i < w * h; i++) {
-		const [y, co, cg] = LFT.rgbToYCoCgR(originalData[i * 4], originalData[i * 4 + 1], originalData[i * 4 + 2]);
-		planes[0][i] = y;
-		planes[1][i] = co;
-		planes[2][i] = cg;
-	}
+	originalData = ctx.getImageData(0, 0, w, h).data; // RGBA Uint8ClampedArray
 
 	const t0 = performance.now();
-	lastBlob = await LFT.encode(w, h, planes);
+	// LFT.encode expects w, h, and a Uint8Array (Uint8ClampedArray is also fine as they share the same memory structure)
+	lastBlob = await LFT.encode(w, h, originalData);
 	const t1 = performance.now();
 
 	document.getElementById("stat-orig-size").innerText = `${(originalData.length / 1024).toFixed(1)} KB`;
@@ -43,22 +36,13 @@ document.getElementById("upload-lft")?.addEventListener("change", async (e) => {
 	if (!file) return;
 
 	const t0 = performance.now();
-	const { w, h, planes } = await LFT.decode(file);
-
-	const out = new Uint8ClampedArray(w * h * 4);
-	for (let i = 0; i < w * h; i++) {
-		const [r, g, b] = LFT.yCoCgRToRgb(planes[0][i], planes[1][i], planes[2][i]);
-		out[i * 4] = r;
-		out[i * 4 + 1] = g;
-		out[i * 4 + 2] = b;
-		out[i * 4 + 3] = 255;
-	}
+	const { w, h, data } = await LFT.decode(file);
 	const t1 = performance.now();
 
 	let diffs = 0;
-	if (originalData && originalData.length === out.length) {
-		for (let i = 0; i < out.length; i++) {
-			if (originalData[i] !== out[i]) diffs++;
+	if (originalData && originalData.length === data.length) {
+		for (let i = 0; i < data.length; i++) {
+			if (originalData[i] !== data[i]) diffs++;
 		}
 	} else {
 		diffs = -1;
@@ -67,7 +51,9 @@ document.getElementById("upload-lft")?.addEventListener("change", async (e) => {
 	const canvas = document.getElementById("canvas-recon");
 	canvas.width = w;
 	canvas.height = h;
-	canvas.getContext("2d").putImageData(new ImageData(out, w, h), 0, 0);
+	// data is Uint8Array, ImageData expects Uint8ClampedArray
+	const clampedData = new Uint8ClampedArray(data.buffer);
+	canvas.getContext("2d").putImageData(new ImageData(clampedData, w, h), 0, 0);
 
 	const log = document.getElementById("status-log");
 	log.innerText = diffs === 0 ? `✅ 検証成功: 完全一致 (${(t1 - t0).toFixed(1)}ms)` : `❌ 検証失敗: ${diffs}件の差異`;
