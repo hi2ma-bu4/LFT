@@ -39,16 +39,7 @@ export class LFT {
 		}
 
 		const activity = dh + dv;
-		let actLevel = 0;
-		if (activity > 1) actLevel = 1;
-		if (activity > 4) actLevel = 2;
-		if (activity > 10) actLevel = 3;
-		if (activity > 22) actLevel = 4;
-		if (activity > 45) actLevel = 5;
-		if (activity > 90) actLevel = 6;
-		if (activity > 180) actLevel = 7;
-
-		return { pred: Math.floor(pred), ctxIdx: actLevel };
+		return { pred: Math.floor(pred), ctxIdx: this.getActivityLevel(activity) };
 	}
 
 	private static med(x: number, y: number, w: number, data: Int32Array): { pred: number; ctxIdx: number } {
@@ -65,16 +56,19 @@ export class LFT {
 		const dh = Math.abs(w_ - nw);
 		const dv = Math.abs(n - nw);
 		const activity = dh + dv;
-		let actLevel = 0;
-		if (activity > 1) actLevel = 1;
-		if (activity > 4) actLevel = 2;
-		if (activity > 10) actLevel = 3;
-		if (activity > 22) actLevel = 4;
-		if (activity > 45) actLevel = 5;
-		if (activity > 90) actLevel = 6;
-		if (activity > 180) actLevel = 7;
 
-		return { pred: Math.floor(pred), ctxIdx: actLevel };
+		return { pred: Math.floor(pred), ctxIdx: this.getActivityLevel(activity) };
+	}
+
+	private static getActivityLevel(activity: number): number {
+		if (activity <= 2) return 0;
+		if (activity <= 6) return 1;
+		if (activity <= 14) return 2;
+		if (activity <= 30) return 3;
+		if (activity <= 62) return 4;
+		if (activity <= 126) return 5;
+		if (activity <= 254) return 6;
+		return 7;
 	}
 
 	private static zigzag(v: number): number {
@@ -105,21 +99,98 @@ export class LFT {
 			if (planes[3][i] !== alpha0) constantAlpha = false;
 		}
 
-		// Pre-pass to choose best predictor per plane
+		// Pre-pass to choose best predictor and CCP factors
 		const predictorTypes = new Uint8Array(4); // 0: GAP, 1: MED
+		const allResiduals = Array.from({ length: 4 }, () => new Int32Array(len));
+		const ccpFactors = new Int8Array(4);
+		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
+
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
 			let errGap = 0,
 				errMed = 0;
+			const data = planes[p];
+			const biasModelsTemp = Array.from({ length: this.CONTEXTS }, () => ({ sum: 0, count: 0 }));
+			const biasModelsMedTemp = Array.from({ length: this.CONTEXTS }, () => ({ sum: 0, count: 0 }));
+
 			for (let y = 0; y < h; y++) {
 				for (let x = 0; x < w; x++) {
-					errGap += Math.abs(planes[p][y * w + x] - this.gap(x, y, w, planes[p]).pred);
-					errMed += Math.abs(planes[p][y * w + x] - this.med(x, y, w, planes[p]).pred);
+					const idx = y * w + x;
+					const resGap = this.gap(x, y, w, data);
+					const resMed = this.med(x, y, w, data);
+
+					const biasGap = biasModelsTemp[resGap.ctxIdx].count > 0 ? Math.round(biasModelsTemp[resGap.ctxIdx].sum / biasModelsTemp[resGap.ctxIdx].count) : 0;
+					const biasMed = biasModelsMedTemp[resMed.ctxIdx].count > 0 ? Math.round(biasModelsMedTemp[resMed.ctxIdx].sum / biasModelsMedTemp[resMed.ctxIdx].count) : 0;
+
+					const diffGap = data[idx] - (resGap.pred + biasGap);
+					const diffMed = data[idx] - (resMed.pred + biasMed);
+
+					errGap += Math.abs(diffGap);
+					errMed += Math.abs(diffMed);
+
+					biasModelsTemp[resGap.ctxIdx].sum += diffGap;
+					biasModelsTemp[resGap.ctxIdx].count++;
+					if (biasModelsTemp[resGap.ctxIdx].count === 256) {
+						biasModelsTemp[resGap.ctxIdx].sum >>= 1;
+						biasModelsTemp[resGap.ctxIdx].count >>= 1;
+					}
+
+					biasModelsMedTemp[resMed.ctxIdx].sum += diffMed;
+					biasModelsMedTemp[resMed.ctxIdx].count++;
+					if (biasModelsMedTemp[resMed.ctxIdx].count === 256) {
+						biasModelsMedTemp[resMed.ctxIdx].sum >>= 1;
+						biasModelsMedTemp[resMed.ctxIdx].count >>= 1;
+					}
 				}
 			}
 			predictorTypes[p] = errMed < errGap ? 1 : 0;
+			const isMed = predictorTypes[p] === 1;
+
+			// Store residuals for CCP
+			for (let i = 0; i < len; i++) {
+				const x = i % w,
+					y = Math.floor(i / w);
+				const { pred } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
+				allResiduals[p][i] = data[i] - pred;
+			}
+
+			if (p === 1 || p === 2) {
+				let bestF = 0;
+				let minErr = Infinity;
+				for (const f of ccpTrials) {
+					let err = 0;
+					const isMed = predictorTypes[p] === 1;
+					const biasModelsCcp = Array.from({ length: this.CONTEXTS }, () => ({ sum: 0, count: 0 }));
+					const data = planes[p];
+
+					for (let y = 0; y < h; y++) {
+						for (let x = 0; x < w; x++) {
+							const idx = y * w + x;
+							const { pred, ctxIdx } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
+							const bias = biasModelsCcp[ctxIdx].count > 0 ? Math.round(biasModelsCcp[ctxIdx].sum / biasModelsCcp[ctxIdx].count) : 0;
+
+							const diff = data[idx] - (pred + bias) - ((allResiduals[0][idx] * f) >> 3);
+							err += Math.abs(diff);
+
+							const actualRes = data[idx] - (pred + bias);
+							biasModelsCcp[ctxIdx].sum += actualRes;
+							biasModelsCcp[ctxIdx].count++;
+							if (biasModelsCcp[ctxIdx].count === 256) {
+								biasModelsCcp[ctxIdx].sum >>= 1;
+								biasModelsCcp[ctxIdx].count >>= 1;
+							}
+						}
+					}
+
+					if (err < minErr) {
+						minErr = err;
+						bestF = f;
+					}
+				}
+				ccpFactors[p] = bestF;
+			}
 		}
 
-		const output = new Uint8Array(len * 5 + 128);
+		const output = new Uint8Array(len * 8 + 1024);
 		let op = 0,
 			low = 0,
 			high = this.RANGE_MAX,
@@ -161,29 +232,59 @@ export class LFT {
 			}
 		};
 
+		const head = new DataView(new ArrayBuffer(12));
+		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+		head.setUint32(4, w);
+		head.setUint32(8, h);
+
 		// Header bits
 		encodeBitRaw(constantAlpha ? 1 : 0);
 		if (constantAlpha) {
 			for (let i = 7; i >= 0; i--) encodeBitRaw((alpha0 >> i) & 1);
 		}
 		for (let p = 0; p < 4; p++) encodeBitRaw(predictorTypes[p]);
+		for (let p = 0; p < 4; p++) {
+			let fIdx = ccpTrials.indexOf(ccpFactors[p]);
+			if (fIdx === -1) fIdx = 8; // 0
+			for (let i = 3; i >= 0; i--) encodeBitRaw((fIdx >> i) & 1);
+		}
 
-		const models = Array.from({ length: 4 * this.CONTEXTS }, () => {
+		const models = Array.from({ length: 4 * this.CONTEXTS * 27 }, () => {
 			const f = new Uint32Array(this.MODEL_SIZE).fill(1);
 			return { f, sum: this.MODEL_SIZE };
 		});
+
+		const biasModels = Array.from({ length: 4 * this.CONTEXTS * 27 }, () => ({ sum: 0, count: 0 }));
 
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
 			const data = planes[p];
 			const isMed = predictorTypes[p] === 1;
 			for (let y = 0; y < h; y++) {
 				for (let x = 0; x < w; x++) {
+					const i = y * w + x;
 					const { pred, ctxIdx } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
-					const diff = data[y * w + x] - pred;
+
+					const leftRes = x > 0 ? allResiduals[p][i - 1] : 0;
+					const upRes = y > 0 ? allResiduals[p][i - w] : 0;
+					const leftSign = leftRes < 0 ? 1 : leftRes > 0 ? 2 : 0;
+					const upSign = upRes < 0 ? 1 : upRes > 0 ? 2 : 0;
+
+					const nwRes = x > 0 && y > 0 ? allResiduals[p][i - w - 1] : 0;
+					const nwSign = nwRes < 0 ? 1 : nwRes > 0 ? 2 : 0;
+
+					const finalCtxIdx = ctxIdx * 27 + leftSign * 9 + upSign * 3 + nwSign;
+					const biasIdx = p * (this.CONTEXTS * 27) + finalCtxIdx;
+
+					const bias = biasModels[biasIdx].count > 0 ? Math.round(biasModels[biasIdx].sum / biasModels[biasIdx].count) : 0;
+					let diff = data[i] - (pred + bias);
+					if (p === 1 || p === 2) {
+						diff -= (allResiduals[0][i] * ccpFactors[p]) >> 3;
+					}
+
 					const zzFull = this.zigzag(diff);
 					let zz = zzFull >>> 0;
 
-					const model = models[p * this.CONTEXTS + ctxIdx];
+					let model = models[biasIdx];
 					if (zz >= this.MODEL_SIZE - 1) zz = this.MODEL_SIZE - 1;
 
 					const range = high - low + 1;
@@ -213,8 +314,19 @@ export class LFT {
 						for (let i = 31; i >= 0; i--) encodeBitRaw((zzFull >>> i) & 1);
 					}
 
-					model.f[zz] += 8;
-					model.sum += 8;
+					// Update bias model
+					const actualResidual = diff + (p === 1 || p === 2 ? (allResiduals[0][i] * ccpFactors[p]) >> 3 : 0);
+					allResiduals[p][i] = actualResidual;
+					biasModels[biasIdx].sum += actualResidual;
+					biasModels[biasIdx].count++;
+					if (biasModels[biasIdx].count === 256) {
+						biasModels[biasIdx].sum >>= 1;
+						biasModels[biasIdx].count >>= 1;
+					}
+
+					const inc = 8 + (ctxIdx < 2 ? 8 : 0);
+					model.f[zz] += inc;
+					model.sum += inc;
 					if (model.sum > 32768) {
 						model.sum = 0;
 						for (let j = 0; j < this.MODEL_SIZE; j++) {
@@ -231,10 +343,6 @@ export class LFT {
 		else applyBit(1);
 		if (bitCount > 0) output[op++] = currentByte << (8 - bitCount);
 
-		const head = new DataView(new ArrayBuffer(12));
-		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
-		head.setUint32(4, w);
-		head.setUint32(8, h);
 		return new Blob([head, output.subarray(0, op)]);
 	}
 
@@ -301,12 +409,22 @@ export class LFT {
 		const predictorTypes = new Uint8Array(4);
 		for (let p = 0; p < 4; p++) predictorTypes[p] = decodeBitRaw();
 
-		const models = Array.from({ length: 4 * this.CONTEXTS }, () => {
+		const ccpFactors = new Int8Array(4);
+		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
+		for (let p = 0; p < 4; p++) {
+			let fIdx = 0;
+			for (let i = 0; i < 4; i++) fIdx = (fIdx << 1) | decodeBitRaw();
+			ccpFactors[p] = ccpTrials[fIdx] ?? 0;
+		}
+
+		const models = Array.from({ length: 4 * this.CONTEXTS * 27 }, () => {
 			const f = new Uint32Array(this.MODEL_SIZE).fill(1);
 			return { f, sum: this.MODEL_SIZE };
 		});
+		const biasModels = Array.from({ length: 4 * this.CONTEXTS * 27 }, () => ({ sum: 0, count: 0 }));
 
 		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
+		const allResiduals = Array.from({ length: 4 }, () => new Int32Array(len));
 		if (constantAlpha) planes[3].fill(alpha0);
 
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
@@ -314,8 +432,22 @@ export class LFT {
 			const isMed = predictorTypes[p] === 1;
 			for (let y = 0; y < h; y++) {
 				for (let x = 0; x < w; x++) {
+					const i = y * w + x;
 					const { pred, ctxIdx } = isMed ? this.med(x, y, w, out) : this.gap(x, y, w, out);
-					const model = models[p * this.CONTEXTS + ctxIdx];
+
+					const leftRes = x > 0 ? allResiduals[p][i - 1] : 0;
+					const upRes = y > 0 ? allResiduals[p][i - w] : 0;
+					const leftSign = leftRes < 0 ? 1 : leftRes > 0 ? 2 : 0;
+					const upSign = upRes < 0 ? 1 : upRes > 0 ? 2 : 0;
+					const nwRes = x > 0 && y > 0 ? allResiduals[p][i - w - 1] : 0;
+					const nwSign = nwRes < 0 ? 1 : nwRes > 0 ? 2 : 0;
+
+					const finalCtxIdx = ctxIdx * 27 + leftSign * 9 + upSign * 3 + nwSign;
+					const biasIdx = p * (this.CONTEXTS * 27) + finalCtxIdx;
+
+					const bias = biasModels[biasIdx].count > 0 ? Math.round(biasModels[biasIdx].sum / biasModels[biasIdx].count) : 0;
+
+					const model = models[biasIdx];
 					const range = high - low + 1;
 					const count = Math.floor(((val - low + 1) * model.sum - 1) / range);
 
@@ -349,10 +481,28 @@ export class LFT {
 						for (let i = 0; i < 32; i++) valZZ = (valZZ << 1) | decodeBitRaw();
 					}
 
-					out[y * w + x] = this.unzigzag(valZZ) + pred;
+					let diff = this.unzigzag(valZZ);
+					const actualResidual = diff + (p === 1 || p === 2 ? (allResiduals[0][i] * ccpFactors[p]) >> 3 : 0);
 
-					model.f[zz] += 8;
-					model.sum += 8;
+					if (p === 1 || p === 2) {
+						allResiduals[p][i] = actualResidual;
+					} else {
+						allResiduals[p][i] = diff;
+					}
+
+					out[i] = allResiduals[p][i] + pred + bias;
+
+					// Update bias model
+					biasModels[biasIdx].sum += actualResidual;
+					biasModels[biasIdx].count++;
+					if (biasModels[biasIdx].count === 256) {
+						biasModels[biasIdx].sum >>= 1;
+						biasModels[biasIdx].count >>= 1;
+					}
+
+					const inc = 8 + (ctxIdx < 2 ? 8 : 0);
+					model.f[zz] += inc;
+					model.sum += inc;
 					if (model.sum > 32768) {
 						model.sum = 0;
 						for (let j = 0; j < this.MODEL_SIZE; j++) {
