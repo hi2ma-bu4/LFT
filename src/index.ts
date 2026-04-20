@@ -41,14 +41,18 @@ export class LFT {
 		const activity = dh + dv;
 		let actLevel = 0;
 		if (activity > 1) actLevel = 1;
-		if (activity > 4) actLevel = 2;
-		if (activity > 10) actLevel = 3;
-		if (activity > 22) actLevel = 4;
-		if (activity > 45) actLevel = 5;
-		if (activity > 90) actLevel = 6;
-		if (activity > 180) actLevel = 7;
+		if (activity > 3) actLevel = 2;
+		if (activity > 7) actLevel = 3;
+		if (activity > 14) actLevel = 4;
+		if (activity > 30) actLevel = 5;
+		if (activity > 60) actLevel = 6;
+		if (activity > 120) actLevel = 7;
+		if (activity > 250) actLevel = 8;
+		if (activity > 450) actLevel = 9;
+		if (activity > 750) actLevel = 10;
 
-		return { pred: Math.floor(pred), ctxIdx: actLevel };
+		const gradCtx = (w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0);
+		return { pred: Math.floor(pred), ctxIdx: (actLevel << 3) | gradCtx };
 	}
 
 	private static med(x: number, y: number, w: number, data: Int32Array): { pred: number; ctxIdx: number } {
@@ -56,6 +60,7 @@ export class LFT {
 		const n = y > 0 ? data[i - w] : 128;
 		const w_ = x > 0 ? data[i - 1] : n;
 		const nw = y > 0 && x > 0 ? data[i - w - 1] : n;
+		const ne = y > 0 && x < w - 1 ? data[i - w + 1] : n;
 
 		let pred: number;
 		if (nw >= Math.max(w_, n)) pred = Math.min(w_, n);
@@ -64,17 +69,21 @@ export class LFT {
 
 		const dh = Math.abs(w_ - nw);
 		const dv = Math.abs(n - nw);
-		const activity = dh + dv;
+		const activity = (dh + dv) * 2;
 		let actLevel = 0;
 		if (activity > 1) actLevel = 1;
-		if (activity > 4) actLevel = 2;
-		if (activity > 10) actLevel = 3;
-		if (activity > 22) actLevel = 4;
-		if (activity > 45) actLevel = 5;
-		if (activity > 90) actLevel = 6;
-		if (activity > 180) actLevel = 7;
+		if (activity > 3) actLevel = 2;
+		if (activity > 7) actLevel = 3;
+		if (activity > 14) actLevel = 4;
+		if (activity > 30) actLevel = 5;
+		if (activity > 60) actLevel = 6;
+		if (activity > 120) actLevel = 7;
+		if (activity > 250) actLevel = 8;
+		if (activity > 450) actLevel = 9;
+		if (activity > 750) actLevel = 10;
 
-		return { pred: Math.floor(pred), ctxIdx: actLevel };
+		const gradCtx = (w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0);
+		return { pred: Math.floor(pred), ctxIdx: (actLevel << 3) | gradCtx };
 	}
 
 	private static zigzag(v: number): number {
@@ -87,8 +96,8 @@ export class LFT {
 	private static readonly RANGE_MAX = 0x3fffffff;
 	private static readonly HALF = 0x20000000;
 	private static readonly QUARTER = 0x10000000;
-	private static readonly MODEL_SIZE = 1025;
-	private static readonly CONTEXTS = 8;
+	private static readonly MODEL_SIZE = 257;
+	private static readonly CONTEXTS = 880; // 11 actLevels * 8 gradCtx * 10 crossStates
 
 	public static async encode(w: number, h: number, rgba: Uint8Array): Promise<Blob> {
 		const len = w * h;
@@ -105,57 +114,65 @@ export class LFT {
 			if (planes[3][i] !== alpha0) constantAlpha = false;
 		}
 
-		// Pre-pass to choose best predictor per plane and global CCP factors
-		const predictorTypes = new Uint8Array(4); // 0: GAP, 1: MED
-		const allResiduals = Array.from({ length: 4 }, () => new Int32Array(len));
-		const ccpFactors = new Int8Array(4);
+		const blockSize = 16;
+		const bw = Math.ceil(w / blockSize);
+		const bh = Math.ceil(h / blockSize);
 		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
+		const allResiduals = Array.from({ length: 4 }, () => new Int32Array(len));
+		const blockParams = Array.from({ length: 4 }, () => new Uint8Array(bw * bh));
 
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
-			let errGap = 0,
-				errMed = 0;
 			const data = planes[p];
-			for (let i = 0; i < len; i++) {
-				const x = i % w,
-					y = Math.floor(i / w);
-				errGap += Math.abs(data[i] - this.gap(x, y, w, data).pred);
-				errMed += Math.abs(data[i] - this.med(x, y, w, data).pred);
-			}
-			predictorTypes[p] = errMed < errGap ? 1 : 0;
-			const isMed = predictorTypes[p] === 1;
-
-			for (let i = 0; i < len; i++) {
-				const x = i % w,
-					y = Math.floor(i / w);
-				const { pred } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
-				allResiduals[p][i] = data[i] - pred;
-			}
-
-			if (p === 1 || p === 2) {
-				let bestF = 0,
-					minErr = Infinity;
-				for (const f of ccpTrials) {
-					let err = 0;
-					for (let i = 0; i < len; i++) {
-						err += Math.abs(allResiduals[p][i] - ((allResiduals[0][i] * f) >> 3));
+			for (let by = 0; by < bh; by++) {
+				const yStart = by * blockSize;
+				const yEnd = Math.min(yStart + blockSize, h);
+				for (let bx = 0; bx < bw; bx++) {
+					const xStart = bx * blockSize;
+					const xEnd = Math.min(xStart + blockSize, w);
+					let bestParam = 0,
+						minErr = Infinity;
+					for (let isMed = 0; isMed <= 1; isMed++) {
+						const fRange = p === 0 ? [0] : Array.from({ length: 16 }, (_, i) => i);
+						for (const fIdx of fRange) {
+							const f = ccpTrials[fIdx];
+							let err = 0;
+							for (let y = yStart; y < yEnd; y++) {
+								const rowOff = y * w;
+								for (let x = xStart; x < xEnd; x++) {
+									const i = rowOff + x;
+									const { pred } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
+									const ccp = p === 0 ? 0 : (allResiduals[0][i] * f) >> 3;
+									err += Math.abs(data[i] - pred - ccp);
+								}
+							}
+							if (err < minErr) {
+								minErr = err;
+								bestParam = isMed | (fIdx << 1);
+							}
+						}
 					}
-					if (err < minErr) {
-						minErr = err;
-						bestF = f;
+					blockParams[p][by * bw + bx] = bestParam;
+					const finalIsMed = (bestParam & 1) === 1;
+					const finalF = ccpTrials[bestParam >> 1];
+					for (let y = yStart; y < yEnd; y++) {
+						const rowOff = y * w;
+						for (let x = xStart; x < xEnd; x++) {
+							const i = rowOff + x;
+							const { pred } = finalIsMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
+							allResiduals[p][i] = data[i] - pred - (p === 0 ? 0 : (allResiduals[0][i] * finalF) >> 3);
+						}
 					}
 				}
-				ccpFactors[p] = bestF;
 			}
 		}
 
-		const output = new Uint8Array(len * 5 + 1024);
+		const output = new Uint8Array(len * 6 + 16384);
 		let op = 0,
 			low = 0,
 			high = this.RANGE_MAX,
-			underflow = 0;
-		let currentByte = 0,
+			underflow = 0,
+			currentByte = 0,
 			bitCount = 0;
-
 		const putBit = (bit: number) => {
 			currentByte = (currentByte << 1) | bit;
 			if (++bitCount === 8) {
@@ -168,7 +185,6 @@ export class LFT {
 			putBit(bit);
 			for (; underflow > 0; underflow--) putBit(bit ^ 1);
 		};
-
 		const encodeBitRaw = (bit: number) => {
 			const range = high - low + 1;
 			const mid = low + Math.floor(range / 2);
@@ -190,39 +206,62 @@ export class LFT {
 			}
 		};
 
-		// Header bits
 		encodeBitRaw(constantAlpha ? 1 : 0);
 		if (constantAlpha) {
 			for (let i = 7; i >= 0; i--) encodeBitRaw((alpha0 >> i) & 1);
 		}
-		for (let p = 0; p < 4; p++) encodeBitRaw(predictorTypes[p]);
-		for (let p = 1; p <= 2; p++) {
-			let fIdx = ccpTrials.indexOf(ccpFactors[p]);
-			if (fIdx === -1) fIdx = 8;
-			for (let i = 3; i >= 0; i--) encodeBitRaw((fIdx >> i) & 1);
+		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
+			for (let i = 0; i < bw * bh; i++) {
+				const param = blockParams[p][i];
+				encodeBitRaw(param & 1);
+				if (p > 0) {
+					for (let b = 3; b >= 0; b--) encodeBitRaw((param >> (b + 1)) & 1);
+				}
+			}
 		}
 
-		const models = Array.from({ length: 4 * this.CONTEXTS * 3 }, () => {
+		const models = Array.from({ length: 4 * this.CONTEXTS }, () => {
 			const f = new Uint32Array(this.MODEL_SIZE).fill(1);
 			return { f, sum: this.MODEL_SIZE };
 		});
-		const biasModels = Array.from({ length: 4 * this.CONTEXTS * 3 }, () => ({ sum: 0, count: 0 }));
+		const biasModels = Array.from({ length: 4 * this.CONTEXTS }, () => ({ sum: 0, count: 0 }));
 
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
 			const data = planes[p];
-			const isMed = predictorTypes[p] === 1;
-			const residualsUsed = new Int32Array(len);
 			for (let y = 0; y < h; y++) {
+				const rowOff = y * w;
+				const by = Math.floor(y / blockSize);
 				for (let x = 0; x < w; x++) {
-					const i = y * w + x;
+					const i = rowOff + x;
+					const bx = Math.floor(x / blockSize);
+					const param = blockParams[p][by * bw + bx];
+					const isMed = (param & 1) === 1;
 					const { pred, ctxIdx } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
-					const signY = p === 1 || p === 2 ? (allResiduals[0][i] < 0 ? 1 : allResiduals[0][i] > 0 ? 2 : 0) : 0;
-					const fullCtxIdx = p * this.CONTEXTS * 3 + ctxIdx * 3 + signY;
 
+					let crossState = 0;
+					if (p === 0) {
+						const rL = x > 0 ? allResiduals[0][i - 1] : 0;
+						const a = Math.abs(rL);
+						const s = rL < 0 ? 1 : rL > 0 ? 2 : 0;
+						if (s === 0) crossState = 0;
+						else if (a <= 2) crossState = s;
+						else if (a <= 8) crossState = s + 2;
+						else crossState = s + 4;
+					} else {
+						const ry = allResiduals[0][i];
+						const a = Math.abs(ry);
+						const s = ry < 0 ? 1 : ry > 0 ? 2 : 0;
+						const rL = x > 0 ? allResiduals[p][i - 1] : 0;
+						const sL = rL < 0 ? 1 : rL > 0 ? 2 : 0;
+						if (s === 0) crossState = sL;
+						else if (a <= 2) crossState = s + 2;
+						else if (a <= 10) crossState = s + 4;
+						else crossState = s + 6;
+					}
+					const fullCtxIdx = p * this.CONTEXTS + ctxIdx * 10 + (crossState > 9 ? 9 : crossState);
 					const bias = biasModels[fullCtxIdx].count > 0 ? Math.trunc(biasModels[fullCtxIdx].sum / biasModels[fullCtxIdx].count) : 0;
-					const ccp = p === 1 || p === 2 ? (allResiduals[0][i] * ccpFactors[p]) >> 3 : 0;
-
-					const diff = data[i] - pred - ccp - bias;
+					const residual = allResiduals[p][i];
+					const diff = residual - bias;
 					const zz = this.zigzag(diff) >>> 0;
 					const zz_c = zz >= this.MODEL_SIZE - 1 ? this.MODEL_SIZE - 1 : zz;
 
@@ -233,7 +272,6 @@ export class LFT {
 					const next_low = low + Math.floor((range * cum) / model.sum);
 					high = low + Math.floor((range * (cum + model.f[zz_c])) / model.sum) - 1;
 					low = next_low;
-
 					while (true) {
 						if (high < this.HALF) applyBit(0);
 						else if (low >= this.HALF) {
@@ -248,21 +286,21 @@ export class LFT {
 						low = (low << 1) >>> 0;
 						high = ((high << 1) | 1) >>> 0;
 					}
-
 					if (zz_c === this.MODEL_SIZE - 1) {
-						for (let b = 31; b >= 0; b--) encodeBitRaw((zz >> b) & 1);
+						const sign = diff < 0 ? 1 : 0;
+						const absVal = Math.abs(diff);
+						encodeBitRaw(sign);
+						for (let b = 11; b >= 0; b--) encodeBitRaw((absVal >> b) & 1);
 					}
-
-					residualsUsed[i] = diff;
-					biasModels[fullCtxIdx].sum += data[i] - pred - ccp;
+					biasModels[fullCtxIdx].sum += residual;
 					biasModels[fullCtxIdx].count++;
 					if (biasModels[fullCtxIdx].count === 128) {
 						biasModels[fullCtxIdx].sum >>= 1;
 						biasModels[fullCtxIdx].count >>= 1;
 					}
-
-					model.f[zz_c] += 8;
-					model.sum += 8;
+					const inc = model.sum < 1024 ? 32 : model.sum < 4096 ? 16 : 8;
+					model.f[zz_c] += inc;
+					model.sum += inc;
 					if (model.sum > 32768) {
 						model.sum = 0;
 						for (let j = 0; j < this.MODEL_SIZE; j++) {
@@ -273,12 +311,10 @@ export class LFT {
 				}
 			}
 		}
-
 		underflow++;
 		if (low < this.QUARTER) applyBit(0);
 		else applyBit(1);
 		if (bitCount > 0) output[op++] = currentByte << (8 - bitCount);
-
 		const head = new DataView(new ArrayBuffer(12));
 		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
 		head.setUint32(4, w);
@@ -293,7 +329,6 @@ export class LFT {
 			h = dv.getUint32(8);
 		const buf = new Uint8Array(ab);
 		const len = w * h;
-
 		let bp = 12,
 			bitIdx = 0;
 		const getBit = () => {
@@ -305,23 +340,16 @@ export class LFT {
 			}
 			return b;
 		};
-
 		let low = 0,
 			high = this.RANGE_MAX,
 			val = 0;
 		for (let i = 0; i < 30; i++) val = ((val << 1) | getBit()) >>> 0;
-
 		const decodeBitRaw = () => {
 			const range = high - low + 1;
 			const mid = low + Math.floor(range / 2);
-			let bit: number;
-			if (val < mid) {
-				bit = 0;
-				high = mid - 1;
-			} else {
-				bit = 1;
-				low = mid;
-			}
+			let bit = val < mid ? 0 : 1;
+			if (bit === 0) high = mid - 1;
+			else low = mid;
 			while (true) {
 				if (high < this.HALF) {
 				} else if (low >= this.HALF) {
@@ -346,51 +374,76 @@ export class LFT {
 			alpha0 = 0;
 			for (let i = 0; i < 8; i++) alpha0 = (alpha0 << 1) | decodeBitRaw();
 		}
-		const predictorTypes = new Uint8Array(4);
-		for (let p = 0; p < 4; p++) predictorTypes[p] = decodeBitRaw();
-
-		const ccpFactors = new Int8Array(4);
+		const blockSize = 16;
+		const bw = Math.ceil(w / blockSize);
+		const bh = Math.ceil(h / blockSize);
+		const blockParams = Array.from({ length: 4 }, () => new Uint8Array(bw * bh));
 		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
-		for (let p = 1; p <= 2; p++) {
-			let fIdx = 0;
-			for (let i = 0; i < 4; i++) fIdx = (fIdx << 1) | decodeBitRaw();
-			ccpFactors[p] = ccpTrials[fIdx] ?? 0;
+		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
+			for (let i = 0; i < bw * bh; i++) {
+				let prm = decodeBitRaw();
+				if (p > 0) {
+					let fIdx = 0;
+					for (let b = 0; b < 4; b++) fIdx = (fIdx << 1) | decodeBitRaw();
+					prm |= fIdx << 1;
+				}
+				blockParams[p][i] = prm;
+			}
 		}
 
-		const models = Array.from({ length: 4 * this.CONTEXTS * 3 }, () => {
+		const models = Array.from({ length: 4 * this.CONTEXTS }, () => {
 			const f = new Uint32Array(this.MODEL_SIZE).fill(1);
 			return { f, sum: this.MODEL_SIZE };
 		});
-		const biasModels = Array.from({ length: 4 * this.CONTEXTS * 3 }, () => ({ sum: 0, count: 0 }));
-
+		const biasModels = Array.from({ length: 4 * this.CONTEXTS }, () => ({ sum: 0, count: 0 }));
 		const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
-		const allResidualsY = new Int32Array(len);
+		const allResiduals = Array.from({ length: 4 }, () => new Int32Array(len));
 		if (constantAlpha) planes[3].fill(alpha0);
 
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
 			const out = planes[p];
-			const isMed = predictorTypes[p] === 1;
 			for (let y = 0; y < h; y++) {
+				const rowOff = y * w;
+				const by = Math.floor(y / blockSize);
 				for (let x = 0; x < w; x++) {
-					const i = y * w + x;
+					const i = rowOff + x;
+					const bx = Math.floor(x / blockSize);
+					const param = blockParams[p][by * bw + bx];
+					const isMed = (param & 1) === 1;
+					const f = ccpTrials[param >> 1];
 					const { pred, ctxIdx } = isMed ? this.med(x, y, w, out) : this.gap(x, y, w, out);
-					const signY = p === 1 || p === 2 ? (allResidualsY[i] < 0 ? 1 : allResidualsY[i] > 0 ? 2 : 0) : 0;
-					const fullCtxIdx = p * this.CONTEXTS * 3 + ctxIdx * 3 + signY;
 
+					let crossState = 0;
+					if (p === 0) {
+						const rL = x > 0 ? allResiduals[0][i - 1] : 0;
+						const a = Math.abs(rL);
+						const s = rL < 0 ? 1 : rL > 0 ? 2 : 0;
+						if (s === 0) crossState = 0;
+						else if (a <= 2) crossState = s;
+						else if (a <= 8) crossState = s + 2;
+						else crossState = s + 4;
+					} else {
+						const ry = allResiduals[0][i];
+						const a = Math.abs(ry);
+						const s = ry < 0 ? 1 : ry > 0 ? 2 : 0;
+						const rL = x > 0 ? allResiduals[p][i - 1] : 0;
+						const sL = rL < 0 ? 1 : rL > 0 ? 2 : 0;
+						if (s === 0) crossState = sL;
+						else if (a <= 2) crossState = s + 2;
+						else if (a <= 10) crossState = s + 4;
+						else crossState = s + 6;
+					}
+					const fullCtxIdx = p * this.CONTEXTS + ctxIdx * 10 + (crossState > 9 ? 9 : crossState);
 					const bias = biasModels[fullCtxIdx].count > 0 ? Math.trunc(biasModels[fullCtxIdx].sum / biasModels[fullCtxIdx].count) : 0;
 					const model = models[fullCtxIdx];
-
 					const range = high - low + 1;
 					const count = Math.floor(((val - low + 1) * model.sum - 1) / range);
-
 					let zz_c = 0,
 						tmpCum = 0;
 					while (tmpCum + model.f[zz_c] <= count) tmpCum += model.f[zz_c++];
-
 					const next_low = low + Math.floor((range * tmpCum) / model.sum);
 					high = low + Math.floor((range * (tmpCum + model.f[zz_c])) / model.sum) - 1;
 					low = next_low;
-
 					while (true) {
 						if (high < this.HALF) {
 						} else if (low >= this.HALF) {
@@ -406,29 +459,28 @@ export class LFT {
 						high = ((high << 1) | 1) >>> 0;
 						val = ((val << 1) | getBit()) >>> 0;
 					}
-
-					let zz = zz_c;
+					let diff = 0;
 					if (zz_c === this.MODEL_SIZE - 1) {
-						zz = 0;
-						for (let b = 0; b < 32; b++) zz = (zz << 1) | decodeBitRaw();
+						const sign = decodeBitRaw();
+						let absVal = 0;
+						for (let b = 0; b < 12; b++) absVal = (absVal << 1) | decodeBitRaw();
+						diff = sign === 1 ? -absVal : absVal;
+					} else {
+						diff = this.unzigzag(zz_c);
 					}
-
-					let diff = this.unzigzag(zz);
-					let unbiased = diff + bias;
-					if (p === 0) allResidualsY[i] = unbiased;
-
-					const ccp = p === 1 || p === 2 ? (allResidualsY[i] * ccpFactors[p]) >> 3 : 0;
-					out[i] = unbiased + pred + ccp;
-
-					biasModels[fullCtxIdx].sum += unbiased;
+					const residual = diff + bias;
+					allResiduals[p][i] = residual;
+					const ccp = p === 0 ? 0 : (allResiduals[0][i] * f) >> 3;
+					out[i] = residual + pred + ccp;
+					biasModels[fullCtxIdx].sum += residual;
 					biasModels[fullCtxIdx].count++;
 					if (biasModels[fullCtxIdx].count === 128) {
 						biasModels[fullCtxIdx].sum >>= 1;
 						biasModels[fullCtxIdx].count >>= 1;
 					}
-
-					model.f[zz_c] += 8;
-					model.sum += 8;
+					const inc = model.sum < 1024 ? 32 : model.sum < 4096 ? 16 : 8;
+					model.f[zz_c] += inc;
+					model.sum += inc;
 					if (model.sum > 32768) {
 						model.sum = 0;
 						for (let j = 0; j < this.MODEL_SIZE; j++) {
@@ -439,7 +491,6 @@ export class LFT {
 				}
 			}
 		}
-
 		const rgba = new Uint8Array(len * 4);
 		for (let i = 0; i < len; i++) {
 			const [r, g, b] = this.yCoCgRToRgb(planes[0][i], planes[1][i], planes[2][i]);
