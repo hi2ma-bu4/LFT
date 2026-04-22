@@ -97,7 +97,7 @@ export class LFT {
 	private static readonly HALF = 0x20000000;
 	private static readonly QUARTER = 0x10000000;
 	private static readonly MODEL_SIZE = 257;
-	private static readonly CONTEXTS = 880; // 11 actLevels * 8 gradCtx * 10 crossStates
+	private static readonly CONTEXTS = 880;
 
 	public static async encode(w: number, h: number, rgba: Uint8Array): Promise<Blob> {
 		const len = w * h;
@@ -166,7 +166,7 @@ export class LFT {
 			}
 		}
 
-		const output = new Uint8Array(len * 6 + 16384);
+		const output = new Uint8Array(len * 8 + 65536);
 		let op = 0,
 			low = 0,
 			high = this.RANGE_MAX,
@@ -290,7 +290,14 @@ export class LFT {
 						const sign = diff < 0 ? 1 : 0;
 						const absVal = Math.abs(diff);
 						encodeBitRaw(sign);
-						for (let b = 11; b >= 0; b--) encodeBitRaw((absVal >> b) & 1);
+						// Rice coding for large values to handle them efficiently
+						let k = 0;
+						while (absVal >= 1 << (k + 8)) {
+							encodeBitRaw(1);
+							k++;
+						}
+						encodeBitRaw(0);
+						for (let b = k + 7; b >= 0; b--) encodeBitRaw((absVal >> b) & 1);
 					}
 					biasModels[fullCtxIdx].sum += residual;
 					biasModels[fullCtxIdx].count++;
@@ -377,7 +384,7 @@ export class LFT {
 		const blockSize = 16;
 		const bw = Math.ceil(w / blockSize);
 		const bh = Math.ceil(h / blockSize);
-		const blockParams = Array.from({ length: 4 }, () => new Uint8Array(bw * bh));
+		const blockParams = Array.from({ length: 4 }, () => new Int32Array(bw * bh));
 		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
 		for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
 			for (let i = 0; i < bw * bh; i++) {
@@ -462,8 +469,10 @@ export class LFT {
 					let diff = 0;
 					if (zz_c === this.MODEL_SIZE - 1) {
 						const sign = decodeBitRaw();
+						let k = 0;
+						while (decodeBitRaw() === 1) k++;
 						let absVal = 0;
-						for (let b = 0; b < 12; b++) absVal = (absVal << 1) | decodeBitRaw();
+						for (let b = 0; b < k + 8; b++) absVal = (absVal << 1) | decodeBitRaw();
 						diff = sign === 1 ? -absVal : absVal;
 					} else {
 						diff = this.unzigzag(zz_c);

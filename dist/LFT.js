@@ -1,5 +1,5 @@
 /*!
- * LFT 1.0.2
+ * LFT 1.1.0
  * Copyright 2026 hi2ma-bu4
  * Licensed under the Apache License, Version 2.0
  * http://www.apache.org/licenses/LICENSE-2.0
@@ -116,7 +116,6 @@ var LFT_MODULE = (() => {
     static QUARTER = 268435456;
     static MODEL_SIZE = 257;
     static CONTEXTS = 880;
-    // 11 actLevels * 8 gradCtx * 10 crossStates
     static async encode(w, h, rgba) {
       const len = w * h;
       const planes = [new Int32Array(len), new Int32Array(len), new Int32Array(len), new Int32Array(len)];
@@ -179,7 +178,7 @@ var LFT_MODULE = (() => {
           }
         }
       }
-      const output = new Uint8Array(len * 6 + 16384);
+      const output = new Uint8Array(len * 8 + 65536);
       let op = 0, low = 0, high = this.RANGE_MAX, underflow = 0, currentByte = 0, bitCount = 0;
       const putBit = (bit) => {
         currentByte = currentByte << 1 | bit;
@@ -293,7 +292,13 @@ var LFT_MODULE = (() => {
               const sign = diff < 0 ? 1 : 0;
               const absVal = Math.abs(diff);
               encodeBitRaw(sign);
-              for (let b = 11; b >= 0; b--) encodeBitRaw(absVal >> b & 1);
+              let k = 0;
+              while (absVal >= 1 << k + 8) {
+                encodeBitRaw(1);
+                k++;
+              }
+              encodeBitRaw(0);
+              for (let b = k + 7; b >= 0; b--) encodeBitRaw(absVal >> b & 1);
             }
             biasModels[fullCtxIdx].sum += residual;
             biasModels[fullCtxIdx].count++;
@@ -374,7 +379,7 @@ var LFT_MODULE = (() => {
       const blockSize = 16;
       const bw = Math.ceil(w / blockSize);
       const bh = Math.ceil(h / blockSize);
-      const blockParams = Array.from({ length: 4 }, () => new Uint8Array(bw * bh));
+      const blockParams = Array.from({ length: 4 }, () => new Int32Array(bw * bh));
       const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
       for (let p = 0; p < (constantAlpha ? 3 : 4); p++) {
         for (let i = 0; i < bw * bh; i++) {
@@ -455,8 +460,10 @@ var LFT_MODULE = (() => {
             let diff = 0;
             if (zz_c === this.MODEL_SIZE - 1) {
               const sign = decodeBitRaw();
+              let k = 0;
+              while (decodeBitRaw() === 1) k++;
               let absVal = 0;
-              for (let b = 0; b < 12; b++) absVal = absVal << 1 | decodeBitRaw();
+              for (let b = 0; b < k + 8; b++) absVal = absVal << 1 | decodeBitRaw();
               diff = sign === 1 ? -absVal : absVal;
             } else {
               diff = this.unzigzag(zz_c);
