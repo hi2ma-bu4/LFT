@@ -86,6 +86,10 @@ var LFT_MODULE = (() => {
   };
   var LFT = class {
     static MAGIC = new Uint8Array([76, 70, 84, 33]);
+    static COMPRESSED_RAW_FORMATS = [
+      { code: 0, format: "deflate" },
+      { code: 1, format: "brotli" }
+    ];
     static rgbToYCoCgR(r, g, b) {
       const co = r - b;
       const tmp = b + (co >> 1);
@@ -165,6 +169,83 @@ var LFT_MODULE = (() => {
     static RANGE_MAX = 1073741823;
     static HALF = 536870912;
     static QUARTER = 268435456;
+    static createRawData(w, h, rgba, isG, cA) {
+      const len = w * h, rawStride = (isG ? 1 : 3) + (cA ? 0 : 1), rawD = new Uint8Array(len * rawStride);
+      for (let i = 0; i < len; i++) {
+        if (isG) rawD[i * rawStride] = rgba[i * 4];
+        else {
+          rawD[i * rawStride] = rgba[i * 4];
+          rawD[i * rawStride + 1] = rgba[i * 4 + 1];
+          rawD[i * rawStride + 2] = rgba[i * 4 + 2];
+        }
+        if (!cA) rawD[i * rawStride + rawStride - 1] = rgba[i * 4 + 3];
+      }
+      return rawD;
+    }
+    static createRawCandidate(w, h, isG, cA, a0, rawD) {
+      const head = new DataView(new ArrayBuffer(15));
+      this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+      head.setUint32(4, w);
+      head.setUint32(8, h);
+      head.setUint8(12, 3);
+      head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
+      head.setUint8(14, cA ? a0 : 0);
+      return { size: 15 + rawD.length, parts: [head, rawD] };
+    }
+    static async runCompression(data, format) {
+      try {
+        const stream = new Blob([data]).stream().pipeThrough(new CompressionStream(format));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      } catch {
+        return null;
+      }
+    }
+    static async runDecompression(data, format) {
+      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream(format));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    static async createCompressedRawCandidate(w, h, isG, cA, a0, rawD, maxSize) {
+      const deflateFormat = this.COMPRESSED_RAW_FORMATS[0];
+      const deflateBytes = await this.runCompression(rawD, deflateFormat.format);
+      if (deflateBytes === null || 16 + deflateBytes.length >= maxSize) return null;
+      let best = { bytes: deflateBytes, code: deflateFormat.code };
+      const brotliFormat = this.COMPRESSED_RAW_FORMATS[1];
+      const brotliBytes = await this.runCompression(rawD, brotliFormat.format);
+      if (brotliBytes !== null && brotliBytes.length < best.bytes.length) {
+        best = { bytes: brotliBytes, code: brotliFormat.code };
+      }
+      const head = new DataView(new ArrayBuffer(16));
+      this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+      head.setUint32(4, w);
+      head.setUint32(8, h);
+      head.setUint8(12, 5);
+      head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
+      head.setUint8(14, cA ? a0 : 0);
+      head.setUint8(15, best.code);
+      return { size: 16 + best.bytes.length, parts: [head, best.bytes] };
+    }
+    static decodeRawData(w, h, raw, isG, cA, a0) {
+      const rgba = new Uint8Array(w * h * 4), stride = (isG ? 1 : 3) + (cA ? 0 : 1);
+      for (let i = 0; i < w * h; i++) {
+        if (isG) {
+          const v = raw[i * stride];
+          rgba[i * 4] = v;
+          rgba[i * 4 + 1] = v;
+          rgba[i * 4 + 2] = v;
+        } else {
+          rgba[i * 4] = raw[i * stride];
+          rgba[i * 4 + 1] = raw[i * stride + 1];
+          rgba[i * 4 + 2] = raw[i * stride + 2];
+        }
+        rgba[i * 4 + 3] = cA ? a0 : raw[i * stride + stride - 1];
+      }
+      return rgba;
+    }
+    static getCompressedRawFormat(code) {
+      const format = this.COMPRESSED_RAW_FORMATS.find((candidate) => candidate.code === code);
+      if (format === void 0) throw new Error(`Unsupported compressed raw format: ${code}`);
+      return format.format;
+    }
     static async encode(w, h, rgba) {
       const len = w * h;
       let cA = true, a0 = rgba[3], isG = true;
@@ -174,19 +255,24 @@ var LFT_MODULE = (() => {
         if (!isG && !cA) break;
       }
       const rawStride = (isG ? 1 : 3) + (cA ? 0 : 1), rawModeSize = 15 + len * rawStride;
+      const rawD = this.createRawData(w, h, rgba, isG, cA);
+      let bestCandidate = this.createRawCandidate(w, h, isG, cA, a0, rawD);
+      const applyCandidate = (candidate) => {
+        if (candidate !== null && candidate.size < bestCandidate.size) bestCandidate = candidate;
+      };
       const colors = /* @__PURE__ */ new Set();
       for (let i = 0; i < len; i++) {
         colors.add(rgba[i * 4] << 24 | rgba[i * 4 + 1] << 16 | rgba[i * 4 + 2] << 8 | rgba[i * 4 + 3]);
         if (colors.size > 256) break;
       }
       if (colors.size === 1) {
-        const head2 = new DataView(new ArrayBuffer(17));
-        this.MAGIC.forEach((b, i) => head2.setUint8(i, b));
-        head2.setUint32(4, w);
-        head2.setUint32(8, h);
-        head2.setUint8(12, 0);
-        head2.setUint32(13, colors.values().next().value);
-        return new Blob([head2]);
+        const head = new DataView(new ArrayBuffer(17));
+        this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+        head.setUint32(4, w);
+        head.setUint32(8, h);
+        head.setUint8(12, 0);
+        head.setUint32(13, colors.values().next().value);
+        return new Blob([head]);
       }
       if (colors.size <= 256) {
         const palette = Array.from(colors).sort((a, b) => (a >>> 0) - (b >>> 0));
@@ -197,18 +283,18 @@ var LFT_MODULE = (() => {
         const { output: encI } = await this.encodePlane(w, h, indices, null, 16);
         const useRawI = encI.length > len, pModeSize = 14 + colors.size * 4 + (useRawI ? len : encI.length);
         if (pModeSize <= rawModeSize) {
-          const head2 = new DataView(new ArrayBuffer(14 + colors.size * 4));
-          this.MAGIC.forEach((b, i) => head2.setUint8(i, b));
-          head2.setUint32(4, w);
-          head2.setUint32(8, h);
-          head2.setUint8(12, useRawI ? 4 : 1);
-          head2.setUint8(13, colors.size - 1);
-          palette.forEach((c, i) => head2.setUint32(14 + i * 4, c >>> 0));
+          const head = new DataView(new ArrayBuffer(14 + colors.size * 4));
+          this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+          head.setUint32(4, w);
+          head.setUint32(8, h);
+          head.setUint8(12, useRawI ? 4 : 1);
+          head.setUint8(13, colors.size - 1);
+          palette.forEach((c, i) => head.setUint32(14 + i * 4, c >>> 0));
           const rawIArr = new Uint8Array(len);
           if (useRawI) {
             for (let i = 0; i < len; i++) rawIArr[i] = indices[i];
           }
-          return new Blob([head2, useRawI ? rawIArr : encI]);
+          applyCandidate({ size: pModeSize, parts: [head, useRawI ? rawIArr : encI] });
         }
       }
       const planes = [];
@@ -247,35 +333,20 @@ var LFT_MODULE = (() => {
           bestBS = bs;
         }
       }
-      if (16 + bestTSize >= rawModeSize) {
-        const rawD = new Uint8Array(len * rawStride);
-        for (let i = 0; i < len; i++) {
-          if (isG) rawD[i * rawStride] = rgba[i * 4];
-          else {
-            rawD[i * rawStride] = rgba[i * 4];
-            rawD[i * rawStride + 1] = rgba[i * 4 + 1];
-            rawD[i * rawStride + 2] = rgba[i * 4 + 2];
-          }
-          if (!cA) rawD[i * rawStride + rawStride - 1] = rgba[i * 4 + 3];
-        }
-        const head2 = new DataView(new ArrayBuffer(15));
-        this.MAGIC.forEach((b, i) => head2.setUint8(i, b));
-        head2.setUint32(4, w);
-        head2.setUint32(8, h);
-        head2.setUint8(12, 3);
-        head2.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
-        head2.setUint8(14, cA ? a0 : 0);
-        return new Blob([head2, rawD]);
+      if (16 + bestTSize < rawModeSize) {
+        const bsHead = new Uint8Array(16);
+        const bsView = new DataView(bsHead.buffer);
+        this.MAGIC.forEach((b, i) => bsView.setUint8(i, b));
+        bsView.setUint32(4, w);
+        bsView.setUint32(8, h);
+        bsView.setUint8(12, 2);
+        bsView.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
+        bsView.setUint8(14, cA ? a0 : 0);
+        bsView.setUint8(15, bestBS);
+        applyCandidate({ size: 16 + bestTSize, parts: [bsHead, ...bestPlanes] });
       }
-      const head = new DataView(new ArrayBuffer(16));
-      this.MAGIC.forEach((b, i) => head.setUint8(i, b));
-      head.setUint32(4, w);
-      head.setUint32(8, h);
-      head.setUint8(12, 2);
-      head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
-      head.setUint8(14, cA ? a0 : 0);
-      head.setUint8(15, bestBS);
-      return new Blob([head, ...bestPlanes]);
+      applyCandidate(await this.createCompressedRawCandidate(w, h, isG, cA, a0, rawD, bestCandidate.size));
+      return new Blob(bestCandidate.parts);
     }
     static async encodePlane(w, h, data, yRes, bs) {
       const bw = Math.ceil(w / bs), bh = Math.ceil(h / bs), len = w * h;
@@ -519,21 +590,11 @@ var LFT_MODULE = (() => {
       }
       const flags = dv.getUint8(13), cA = (flags & 1) === 1, isG = (flags & 2) === 2, a0 = dv.getUint8(14);
       if (mode === 3) {
-        const rgba2 = new Uint8Array(w * h * 4), raw = new Uint8Array(ab.slice(15)), stride = (isG ? 1 : 3) + (cA ? 0 : 1);
-        for (let i = 0; i < w * h; i++) {
-          if (isG) {
-            const v = raw[i * stride];
-            rgba2[i * 4] = v;
-            rgba2[i * 4 + 1] = v;
-            rgba2[i * 4 + 2] = v;
-          } else {
-            rgba2[i * 4] = raw[i * stride];
-            rgba2[i * 4 + 1] = raw[i * stride + 1];
-            rgba2[i * 4 + 2] = raw[i * stride + 2];
-          }
-          rgba2[i * 4 + 3] = cA ? a0 : raw[i * stride + stride - 1];
-        }
-        return { w, h, data: rgba2 };
+        return { w, h, data: this.decodeRawData(w, h, new Uint8Array(ab.slice(15)), isG, cA, a0) };
+      }
+      if (mode === 5) {
+        const formatCode = dv.getUint8(15), raw = await this.runDecompression(new Uint8Array(ab.slice(16)), this.getCompressedRawFormat(formatCode));
+        return { w, h, data: this.decodeRawData(w, h, raw, isG, cA, a0) };
       }
       let offset = 16;
       const bs = dv.getUint8(15), planes = [];

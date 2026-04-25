@@ -62,8 +62,17 @@ class Model {
 	}
 }
 
+type EncodedCandidate = {
+	size: number;
+	parts: BlobPart[];
+};
+
 export class LFT {
 	private static readonly MAGIC = new Uint8Array([76, 70, 84, 33]);
+	private static readonly COMPRESSED_RAW_FORMATS = [
+		{ code: 0, format: "deflate" },
+		{ code: 1, format: "brotli" },
+	] as const;
 
 	private static rgbToYCoCgR(r: number, g: number, b: number): [number, number, number] {
 		const co = r - b;
@@ -152,6 +161,93 @@ export class LFT {
 	private static readonly HALF = 0x20000000;
 	private static readonly QUARTER = 0x10000000;
 
+	private static createRawData(w: number, h: number, rgba: Uint8Array<ArrayBuffer>, isG: boolean, cA: boolean): Uint8Array<ArrayBuffer> {
+		const len = w * h,
+			rawStride = (isG ? 1 : 3) + (cA ? 0 : 1),
+			rawD = new Uint8Array(len * rawStride);
+		for (let i = 0; i < len; i++) {
+			if (isG) rawD[i * rawStride] = rgba[i * 4];
+			else {
+				rawD[i * rawStride] = rgba[i * 4];
+				rawD[i * rawStride + 1] = rgba[i * 4 + 1];
+				rawD[i * rawStride + 2] = rgba[i * 4 + 2];
+			}
+			if (!cA) rawD[i * rawStride + rawStride - 1] = rgba[i * 4 + 3];
+		}
+		return rawD;
+	}
+
+	private static createRawCandidate(w: number, h: number, isG: boolean, cA: boolean, a0: number, rawD: Uint8Array<ArrayBuffer>): EncodedCandidate {
+		const head = new DataView(new ArrayBuffer(15));
+		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+		head.setUint32(4, w);
+		head.setUint32(8, h);
+		head.setUint8(12, 3);
+		head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
+		head.setUint8(14, cA ? a0 : 0);
+		return { size: 15 + rawD.length, parts: [head, rawD] };
+	}
+
+	private static async runCompression(data: Uint8Array<ArrayBuffer>, format: string): Promise<Uint8Array<ArrayBuffer> | null> {
+		try {
+			const stream = new Blob([data]).stream().pipeThrough(new CompressionStream(format as any));
+			return new Uint8Array(await new Response(stream).arrayBuffer());
+		} catch {
+			return null;
+		}
+	}
+
+	private static async runDecompression(data: Uint8Array<ArrayBuffer>, format: string): Promise<Uint8Array<ArrayBuffer>> {
+		const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream(format as any));
+		return new Uint8Array(await new Response(stream).arrayBuffer());
+	}
+
+	private static async createCompressedRawCandidate(w: number, h: number, isG: boolean, cA: boolean, a0: number, rawD: Uint8Array<ArrayBuffer>, maxSize: number): Promise<EncodedCandidate | null> {
+		const deflateFormat = this.COMPRESSED_RAW_FORMATS[0];
+		const deflateBytes = await this.runCompression(rawD, deflateFormat.format);
+		if (deflateBytes === null || 16 + deflateBytes.length >= maxSize) return null;
+		let best: { bytes: Uint8Array<ArrayBuffer>; code: number } = { bytes: deflateBytes, code: deflateFormat.code };
+		const brotliFormat = this.COMPRESSED_RAW_FORMATS[1];
+		const brotliBytes = await this.runCompression(rawD, brotliFormat.format);
+		if (brotliBytes !== null && brotliBytes.length < best.bytes.length) {
+			best = { bytes: brotliBytes, code: brotliFormat.code };
+		}
+		const head = new DataView(new ArrayBuffer(16));
+		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
+		head.setUint32(4, w);
+		head.setUint32(8, h);
+		head.setUint8(12, 5);
+		head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
+		head.setUint8(14, cA ? a0 : 0);
+		head.setUint8(15, best.code);
+		return { size: 16 + best.bytes.length, parts: [head, best.bytes] };
+	}
+
+	private static decodeRawData(w: number, h: number, raw: Uint8Array<ArrayBuffer>, isG: boolean, cA: boolean, a0: number): Uint8Array<ArrayBuffer> {
+		const rgba = new Uint8Array(w * h * 4),
+			stride = (isG ? 1 : 3) + (cA ? 0 : 1);
+		for (let i = 0; i < w * h; i++) {
+			if (isG) {
+				const v = raw[i * stride];
+				rgba[i * 4] = v;
+				rgba[i * 4 + 1] = v;
+				rgba[i * 4 + 2] = v;
+			} else {
+				rgba[i * 4] = raw[i * stride];
+				rgba[i * 4 + 1] = raw[i * stride + 1];
+				rgba[i * 4 + 2] = raw[i * stride + 2];
+			}
+			rgba[i * 4 + 3] = cA ? a0 : raw[i * stride + stride - 1];
+		}
+		return rgba;
+	}
+
+	private static getCompressedRawFormat(code: number): string {
+		const format = this.COMPRESSED_RAW_FORMATS.find((candidate) => candidate.code === code);
+		if (format === undefined) throw new Error(`Unsupported compressed raw format: ${code}`);
+		return format.format;
+	}
+
 	public static async encode(w: number, h: number, rgba: Uint8Array<ArrayBuffer>): Promise<Blob> {
 		const len = w * h;
 		let cA = true,
@@ -164,6 +260,11 @@ export class LFT {
 		}
 		const rawStride = (isG ? 1 : 3) + (cA ? 0 : 1),
 			rawModeSize = 15 + len * rawStride;
+		const rawD = this.createRawData(w, h, rgba, isG, cA);
+		let bestCandidate = this.createRawCandidate(w, h, isG, cA, a0, rawD);
+		const applyCandidate = (candidate: EncodedCandidate | null) => {
+			if (candidate !== null && candidate.size < bestCandidate.size) bestCandidate = candidate;
+		};
 		const colors = new Set<number>();
 		for (let i = 0; i < len; i++) {
 			colors.add((rgba[i * 4] << 24) | (rgba[i * 4 + 1] << 16) | (rgba[i * 4 + 2] << 8) | rgba[i * 4 + 3]);
@@ -199,7 +300,7 @@ export class LFT {
 				if (useRawI) {
 					for (let i = 0; i < len; i++) rawIArr[i] = indices[i];
 				}
-				return new Blob([head, useRawI ? rawIArr : encI]);
+				applyCandidate({ size: pModeSize, parts: [head, useRawI ? rawIArr : encI] });
 			}
 		}
 		const planes: Int32Array[] = [];
@@ -242,35 +343,20 @@ export class LFT {
 				bestBS = bs;
 			}
 		}
-		if (16 + bestTSize >= rawModeSize) {
-			const rawD = new Uint8Array(len * rawStride);
-			for (let i = 0; i < len; i++) {
-				if (isG) rawD[i * rawStride] = rgba[i * 4];
-				else {
-					rawD[i * rawStride] = rgba[i * 4];
-					rawD[i * rawStride + 1] = rgba[i * 4 + 1];
-					rawD[i * rawStride + 2] = rgba[i * 4 + 2];
-				}
-				if (!cA) rawD[i * rawStride + rawStride - 1] = rgba[i * 4 + 3];
-			}
-			const head = new DataView(new ArrayBuffer(15));
-			this.MAGIC.forEach((b, i) => head.setUint8(i, b));
-			head.setUint32(4, w);
-			head.setUint32(8, h);
-			head.setUint8(12, 3);
-			head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
-			head.setUint8(14, cA ? a0 : 0);
-			return new Blob([head, rawD]);
+		if (16 + bestTSize < rawModeSize) {
+			const bsHead = new Uint8Array(16);
+			const bsView = new DataView(bsHead.buffer);
+			this.MAGIC.forEach((b, i) => bsView.setUint8(i, b));
+			bsView.setUint32(4, w);
+			bsView.setUint32(8, h);
+			bsView.setUint8(12, 2);
+			bsView.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
+			bsView.setUint8(14, cA ? a0 : 0);
+			bsView.setUint8(15, bestBS);
+			applyCandidate({ size: 16 + bestTSize, parts: [bsHead, ...bestPlanes] });
 		}
-		const head = new DataView(new ArrayBuffer(16));
-		this.MAGIC.forEach((b, i) => head.setUint8(i, b));
-		head.setUint32(4, w);
-		head.setUint32(8, h);
-		head.setUint8(12, 2);
-		head.setUint8(13, (cA ? 1 : 0) | (isG ? 2 : 0));
-		head.setUint8(14, cA ? a0 : 0);
-		head.setUint8(15, bestBS);
-		return new Blob([head, ...bestPlanes]);
+		applyCandidate(await this.createCompressedRawCandidate(w, h, isG, cA, a0, rawD, bestCandidate.size));
+		return new Blob(bestCandidate.parts);
 	}
 
 	private static async encodePlane(w: number, h: number, data: Int32Array, yRes: Int32Array | null, bs: number): Promise<{ output: Uint8Array<ArrayBuffer>; residuals: Int32Array }> {
@@ -569,23 +655,12 @@ export class LFT {
 			isG = (flags & 2) === 2,
 			a0 = dv.getUint8(14);
 		if (mode === 3) {
-			const rgba = new Uint8Array(w * h * 4),
-				raw = new Uint8Array(ab.slice(15)),
-				stride = (isG ? 1 : 3) + (cA ? 0 : 1);
-			for (let i = 0; i < w * h; i++) {
-				if (isG) {
-					const v = raw[i * stride];
-					rgba[i * 4] = v;
-					rgba[i * 4 + 1] = v;
-					rgba[i * 4 + 2] = v;
-				} else {
-					rgba[i * 4] = raw[i * stride];
-					rgba[i * 4 + 1] = raw[i * stride + 1];
-					rgba[i * 4 + 2] = raw[i * stride + 2];
-				}
-				rgba[i * 4 + 3] = cA ? a0 : raw[i * stride + stride - 1];
-			}
-			return { w, h, data: rgba };
+			return { w, h, data: this.decodeRawData(w, h, new Uint8Array(ab.slice(15)), isG, cA, a0) };
+		}
+		if (mode === 5) {
+			const formatCode = dv.getUint8(15),
+				raw = await this.runDecompression(new Uint8Array(ab.slice(16)), this.getCompressedRawFormat(formatCode));
+			return { w, h, data: this.decodeRawData(w, h, raw, isG, cA, a0) };
 		}
 		let offset = 16;
 		const bs = dv.getUint8(15),
