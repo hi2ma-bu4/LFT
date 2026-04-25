@@ -67,6 +67,13 @@ type EncodedCandidate = {
 	parts: BlobPart[];
 };
 
+type DominantOverlayComponent = {
+	x: number;
+	y: number;
+	family: number;
+	pixels: number[];
+};
+
 export class LFT {
 	private static readonly MAGIC = new Uint8Array([76, 70, 84, 33]);
 	private static readonly COMPRESSED_RAW_FORMATS = [
@@ -248,6 +255,248 @@ export class LFT {
 		return format.format;
 	}
 
+	private static pushVarint(target: number[], value: number): void {
+		while (value >= 0x80) {
+			target.push((value & 0x7f) | 0x80);
+			value >>>= 7;
+		}
+		target.push(value);
+	}
+
+	private static readVarint(data: Uint8Array<ArrayBuffer>, offset: number): { value: number; offset: number } {
+		let value = 0,
+			shift = 0;
+		while (offset < data.length) {
+			const byte = data[offset++];
+			value |= (byte & 0x7f) << shift;
+			if ((byte & 0x80) === 0) return { value, offset };
+			shift += 7;
+		}
+		throw new Error("Unexpected end of dominant overlay stream");
+	}
+
+	private static pushZigZagVarint(target: number[], value: number): void {
+		this.pushVarint(target, this.zigzag(value));
+	}
+
+	private static readZigZagVarint(data: Uint8Array<ArrayBuffer>, offset: number): { value: number; offset: number } {
+		const decoded = this.readVarint(data, offset);
+		return { value: this.unzigzag(decoded.value), offset: decoded.offset };
+	}
+
+	private static async createCompressedPayloadCandidate(w: number, h: number, mode: number, extraHeader: number[], payload: Uint8Array<ArrayBuffer>, maxSize: number): Promise<EncodedCandidate | null> {
+		const deflateFormat = this.COMPRESSED_RAW_FORMATS[0];
+		const deflateBytes = await this.runCompression(payload, deflateFormat.format);
+		if (deflateBytes === null || 14 + extraHeader.length + deflateBytes.length >= maxSize) return null;
+		let best: { bytes: Uint8Array<ArrayBuffer>; code: number } = { bytes: deflateBytes, code: deflateFormat.code };
+		const brotliFormat = this.COMPRESSED_RAW_FORMATS[1];
+		const brotliBytes = await this.runCompression(payload, brotliFormat.format);
+		if (brotliBytes !== null && brotliBytes.length < best.bytes.length) best = { bytes: brotliBytes, code: brotliFormat.code };
+		const head = new Uint8Array(14 + extraHeader.length);
+		const view = new DataView(head.buffer);
+		this.MAGIC.forEach((b, i) => view.setUint8(i, b));
+		view.setUint32(4, w);
+		view.setUint32(8, h);
+		view.setUint8(12, mode);
+		view.setUint8(13, best.code);
+		head.set(extraHeader, 14);
+		return { size: head.length + best.bytes.length, parts: [head, best.bytes] };
+	}
+
+	private static getRgbDistance(a: number, b: number): number {
+		const dr = ((a >>> 24) & 0xff) - ((b >>> 24) & 0xff),
+			dg = ((a >>> 16) & 0xff) - ((b >>> 16) & 0xff),
+			db = ((a >>> 8) & 0xff) - ((b >>> 8) & 0xff);
+		return dr * dr + dg * dg + db * db;
+	}
+
+	private static getDominantOverlayFamily(color: number, dominantColors: readonly number[]): number {
+		let best = 0,
+			bestDistance = Infinity;
+		for (let i = 0; i < dominantColors.length; i++) {
+			const distance = this.getRgbDistance(color, dominantColors[i]);
+			if (distance < bestDistance) {
+				bestDistance = distance;
+				best = i;
+			}
+		}
+		return best;
+	}
+
+	private static createDominantOverlayTopKCandidates(sortedPaletteIndices: number[]): number[] {
+		if (sortedPaletteIndices.length <= 2) return [];
+		const maxTopK = Math.min(sortedPaletteIndices.length - 1, Math.max(2, Math.ceil(Math.sqrt(sortedPaletteIndices.length))));
+		const candidates: number[] = [];
+		for (let topK = 2; topK <= maxTopK; topK++) candidates.push(topK);
+		return candidates;
+	}
+
+	private static async createDominantOverlayCandidate(
+		w: number,
+		h: number,
+		palette: number[],
+		indices: Int32Array,
+		maxSize: number
+	): Promise<EncodedCandidate | null> {
+		if (palette.length <= 2) return null;
+		const len = w * h,
+			freqs = new Uint32Array(palette.length);
+		for (let i = 0; i < len; i++) freqs[indices[i]]++;
+		const sortedPaletteIndices = Array.from({ length: palette.length }, (_, i) => i).sort((a, b) => freqs[b] - freqs[a] || ((palette[a] >>> 0) - (palette[b] >>> 0))),
+			candidateTopKs = this.createDominantOverlayTopKCandidates(sortedPaletteIndices);
+		let bestCandidate: EncodedCandidate | null = null;
+		for (const topK of candidateTopKs) {
+			const dominantIndices = sortedPaletteIndices.slice(0, topK),
+				dominantColors = dominantIndices.map((idx) => palette[idx] >>> 0),
+				familyOfPalette = new Int16Array(palette.length).fill(-1),
+				isDominantPalette = new Uint8Array(palette.length);
+			dominantIndices.forEach((paletteIdx, family) => (familyOfPalette[paletteIdx] = family));
+			dominantIndices.forEach((paletteIdx) => (isDominantPalette[paletteIdx] = 1));
+			for (let i = 0; i < palette.length; i++) {
+				if (familyOfPalette[i] !== -1) continue;
+				familyOfPalette[i] = this.getDominantOverlayFamily(palette[i] >>> 0, dominantColors);
+			}
+			const labels = new Uint8Array(len),
+				overlayMask = new Uint8Array(len);
+			for (let i = 0; i < len; i++) {
+				const paletteIdx = indices[i];
+				labels[i] = familyOfPalette[paletteIdx];
+				if (isDominantPalette[paletteIdx] === 0) overlayMask[i] = 1;
+			}
+			const visited = new Uint8Array(len),
+				queue = new Uint32Array(len),
+				components: DominantOverlayComponent[] = [];
+			let componentSpan = 1;
+			for (let start = 0; start < len; start++) {
+				if (overlayMask[start] === 0 || visited[start] === 1) continue;
+				let head = 0,
+					tail = 0,
+					minX = w,
+					minY = h,
+					maxX = -1,
+					maxY = -1;
+				const pixels: number[] = [],
+					familyVotes = new Uint16Array(topK);
+				visited[start] = 1;
+				queue[tail++] = start;
+				while (head < tail) {
+					const pixel = queue[head++],
+						x = pixel % w,
+						y = Math.floor(pixel / w),
+						family = labels[pixel];
+					pixels.push(pixel);
+					familyVotes[family]++;
+					if (x < minX) minX = x;
+					if (x > maxX) maxX = x;
+					if (y < minY) minY = y;
+					if (y > maxY) maxY = y;
+					if (x > 0) {
+						const next = pixel - 1;
+						if (overlayMask[next] === 1 && visited[next] === 0) {
+							visited[next] = 1;
+							queue[tail++] = next;
+						}
+					}
+					if (x + 1 < w) {
+						const next = pixel + 1;
+						if (overlayMask[next] === 1 && visited[next] === 0) {
+							visited[next] = 1;
+							queue[tail++] = next;
+						}
+					}
+					if (y > 0) {
+						const next = pixel - w;
+						if (overlayMask[next] === 1 && visited[next] === 0) {
+							visited[next] = 1;
+							queue[tail++] = next;
+						}
+					}
+					if (y + 1 < h) {
+						const next = pixel + w;
+						if (overlayMask[next] === 1 && visited[next] === 0) {
+							visited[next] = 1;
+							queue[tail++] = next;
+						}
+					}
+				}
+				const spanW = maxX - minX + 1,
+					spanH = maxY - minY + 1,
+					maxSpan = Math.max(spanW, spanH);
+				if (maxSpan > 0xff) {
+					componentSpan = 0x100;
+					break;
+				}
+				if (maxSpan > componentSpan) componentSpan = maxSpan;
+				let family = 0;
+				for (let i = 1; i < topK; i++) if (familyVotes[i] > familyVotes[family]) family = i;
+				for (const pixel of pixels) labels[pixel] = family;
+				components.push({ x: minX, y: minY, family, pixels });
+			}
+			if (componentSpan > 0xff) continue;
+			const familyColorFreqs = Array.from({ length: topK }, () => new Map<number, number>());
+			for (const component of components) {
+				for (const pixel of component.pixels) {
+					const color = palette[indices[pixel]] >>> 0,
+						freq = familyColorFreqs[component.family].get(color) ?? 0;
+					familyColorFreqs[component.family].set(color, freq + 1);
+				}
+			}
+			const familyColorMaps = familyColorFreqs.map((freqMap) => {
+				const entries = [...freqMap.entries()].sort((a, b) => b[1] - a[1] || ((a[0] >>> 0) - (b[0] >>> 0))),
+					colorMap = new Map<number, number>();
+				entries.forEach(([color], index) => colorMap.set(color, index));
+				return colorMap;
+			});
+			if (familyColorMaps.some((colorMap) => colorMap.size >= 0xff)) continue;
+			const overlayBytes: number[] = [];
+			for (const color of dominantColors) {
+				overlayBytes.push((color >>> 24) & 0xff, (color >>> 16) & 0xff, (color >>> 8) & 0xff, color & 0xff);
+			}
+			for (let family = 0; family < topK; family++) {
+				const entries = [...familyColorMaps[family].entries()].sort((a, b) => a[1] - b[1]);
+				overlayBytes.push(entries.length);
+				const base = dominantColors[family],
+					baseR = (base >>> 24) & 0xff,
+					baseG = (base >>> 16) & 0xff,
+					baseB = (base >>> 8) & 0xff;
+				for (const [color] of entries) {
+					overlayBytes.push((((color >>> 24) & 0xff) - baseR + 256) & 0xff, (((color >>> 16) & 0xff) - baseG + 256) & 0xff, (((color >>> 8) & 0xff) - baseB + 256) & 0xff);
+				}
+			}
+			components.sort((a, b) => a.family - b.family || a.y - b.y || a.x - b.x);
+			this.pushVarint(overlayBytes, components.length);
+			const familyCounts = new Uint32Array(topK);
+			for (const component of components) familyCounts[component.family]++;
+			for (let family = 0; family < topK; family++) this.pushVarint(overlayBytes, familyCounts[family]);
+			let prevPos = 0;
+			for (const component of components) {
+				const pos = component.y * w + component.x;
+				this.pushZigZagVarint(overlayBytes, pos - prevPos);
+				prevPos = pos;
+			}
+			const componentGrids = components.map((component) => {
+				const grid = new Uint8Array(componentSpan * componentSpan);
+				grid.fill(0xff);
+				for (const pixel of component.pixels) {
+					const x = pixel % w,
+						y = Math.floor(pixel / w),
+						local = (y - component.y) * componentSpan + (x - component.x);
+					grid[local] = familyColorMaps[component.family].get(palette[indices[pixel]] >>> 0) ?? 0xff;
+				}
+				return grid;
+			});
+			for (let cell = 0; cell < componentSpan * componentSpan; cell++) {
+				for (const grid of componentGrids) overlayBytes.push(grid[cell]);
+			}
+			const payload = new Uint8Array(len + overlayBytes.length);
+			payload.set(labels, 0);
+			payload.set(overlayBytes, len);
+			const candidate = await this.createCompressedPayloadCandidate(w, h, 6, [topK, componentSpan], payload, bestCandidate?.size ?? maxSize);
+			if (candidate !== null && (bestCandidate === null || candidate.size < bestCandidate.size)) bestCandidate = candidate;
+		}
+		return bestCandidate;
+	}
+
 	public static async encode(w: number, h: number, rgba: Uint8Array<ArrayBuffer>): Promise<Blob> {
 		const len = w * h;
 		let cA = true,
@@ -288,6 +537,7 @@ export class LFT {
 			const { output: encI } = await this.encodePlane(w, h, indices, null, 16);
 			const useRawI = encI.length > len,
 				pModeSize = 14 + colors.size * 4 + (useRawI ? len : encI.length);
+			if (cA && a0 === 255) applyCandidate(await this.createDominantOverlayCandidate(w, h, palette, indices, bestCandidate.size));
 			if (pModeSize <= rawModeSize) {
 				const head = new DataView(new ArrayBuffer(14 + colors.size * 4));
 				this.MAGIC.forEach((b, i) => head.setUint8(i, b));
@@ -661,6 +911,78 @@ export class LFT {
 			const formatCode = dv.getUint8(15),
 				raw = await this.runDecompression(new Uint8Array(ab.slice(16)), this.getCompressedRawFormat(formatCode));
 			return { w, h, data: this.decodeRawData(w, h, raw, isG, cA, a0) };
+		}
+		if (mode === 6) {
+			const topK = dv.getUint8(14),
+				componentSpan = dv.getUint8(15),
+				payload = await this.runDecompression(new Uint8Array(ab.slice(16)), this.getCompressedRawFormat(dv.getUint8(13))),
+				len = w * h;
+			let offset = 0;
+			const labels = payload.subarray(offset, offset + len);
+			offset += len;
+			const dominantColors = new Uint32Array(topK);
+			for (let i = 0; i < topK; i++) {
+				dominantColors[i] =
+					(payload[offset] << 24) | (payload[offset + 1] << 16) | (payload[offset + 2] << 8) | payload[offset + 3];
+				offset += 4;
+			}
+			const familyPalettes: number[][] = Array.from({ length: topK }, () => []);
+			for (let family = 0; family < topK; family++) {
+				const count = payload[offset++],
+					base = dominantColors[family],
+					baseR = (base >>> 24) & 0xff,
+					baseG = (base >>> 16) & 0xff,
+					baseB = (base >>> 8) & 0xff;
+				for (let i = 0; i < count; i++) {
+					const color =
+						((((baseR + payload[offset++]) & 0xff) << 24) | (((baseG + payload[offset++]) & 0xff) << 16) | (((baseB + payload[offset++]) & 0xff) << 8) | 0xff) >>> 0;
+					familyPalettes[family].push(color);
+				}
+			}
+			const rgba = new Uint8Array(len * 4);
+			for (let i = 0; i < len; i++) {
+				const color = dominantColors[labels[i]];
+				rgba[i * 4] = (color >>> 24) & 0xff;
+				rgba[i * 4 + 1] = (color >>> 16) & 0xff;
+				rgba[i * 4 + 2] = (color >>> 8) & 0xff;
+				rgba[i * 4 + 3] = color & 0xff;
+			}
+			const componentCountInfo = this.readVarint(payload, offset);
+			offset = componentCountInfo.offset;
+			const families = new Uint8Array(componentCountInfo.value);
+			let familyOffset = 0;
+			for (let family = 0; family < topK; family++) {
+				const familyCountInfo = this.readVarint(payload, offset);
+				offset = familyCountInfo.offset;
+				families.fill(family, familyOffset, familyOffset + familyCountInfo.value);
+				familyOffset += familyCountInfo.value;
+			}
+			const positions = new Uint32Array(componentCountInfo.value);
+			let prevPos = 0;
+			for (let c = 0; c < componentCountInfo.value; c++) {
+				const posInfo = this.readZigZagVarint(payload, offset);
+				offset = posInfo.offset;
+				prevPos += posInfo.value;
+				positions[c] = prevPos;
+			}
+			for (let cell = 0; cell < componentSpan * componentSpan; cell++) {
+				const gx = cell % componentSpan,
+					gy = Math.floor(cell / componentSpan);
+				for (let c = 0; c < componentCountInfo.value; c++) {
+					const colorIdx = payload[offset++];
+					if (colorIdx === 0xff) continue;
+					const x = positions[c] % w,
+						y = Math.floor(positions[c] / w);
+					if (x + gx >= w || y + gy >= h) continue;
+					const color = familyPalettes[families[c]][colorIdx],
+						pixel = ((y + gy) * w + (x + gx)) * 4;
+					rgba[pixel] = (color >>> 24) & 0xff;
+					rgba[pixel + 1] = (color >>> 16) & 0xff;
+					rgba[pixel + 2] = (color >>> 8) & 0xff;
+					rgba[pixel + 3] = color & 0xff;
+				}
+			}
+			return { w, h, data: rgba };
 		}
 		let offset = 16;
 		const bs = dv.getUint8(15),
