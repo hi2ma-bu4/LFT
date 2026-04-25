@@ -104,7 +104,7 @@ var LFT_MODULE = (() => {
       const r = b + co;
       return [r, g, b];
     }
-    static gap(x, y, w, data) {
+    static gapInto(x, y, w, data, out) {
       const i = y * w + x;
       const n = y > 0 ? data[i - w] : 128;
       const w_ = x > 0 ? data[i - 1] : n;
@@ -134,9 +134,10 @@ var LFT_MODULE = (() => {
       if (activity > 250) aL = 8;
       if (activity > 450) aL = 9;
       if (activity > 750) aL = 10;
-      return { pred: Math.floor(pred), ctxIdx: aL << 3 | ((w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0)) };
+      out[0] = Math.floor(pred);
+      out[1] = aL << 3 | ((w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0));
     }
-    static med(x, y, w, data) {
+    static medInto(x, y, w, data, out) {
       const i = y * w + x;
       const n = y > 0 ? data[i - w] : 128;
       const w_ = x > 0 ? data[i - 1] : n;
@@ -158,7 +159,8 @@ var LFT_MODULE = (() => {
       if (activity > 250) aL = 8;
       if (activity > 450) aL = 9;
       if (activity > 750) aL = 10;
-      return { pred: Math.floor(pred), ctxIdx: aL << 3 | ((w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0)) };
+      out[0] = Math.floor(pred);
+      out[1] = aL << 3 | ((w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0));
     }
     static zigzag(v) {
       return v << 1 ^ v >> 31;
@@ -549,8 +551,11 @@ var LFT_MODULE = (() => {
     static async encodePlane(w, h, data, yRes, bs) {
       const bw = Math.ceil(w / bs), bh = Math.ceil(h / bs), len = w * h;
       const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
-      const blockParams = new Int32Array(bw * bh), planeResiduals = new Int32Array(len);
-      const blockCapacity = bs * bs, blockValues = new Int32Array(blockCapacity), gapPreds = new Int32Array(blockCapacity), medPreds = new Int32Array(blockCapacity), avgPreds = new Int32Array(blockCapacity), yBlock = yRes === null ? null : new Int32Array(blockCapacity);
+      const blockParams = new Int32Array(bw * bh), planeResiduals = new Int32Array(len), planeCtxIdx = new Uint8Array(len);
+      const blockXByPixel = new Uint16Array(w), blockRowOffsetByPixel = new Int32Array(h);
+      for (let x = 0; x < w; x++) blockXByPixel[x] = Math.floor(x / bs);
+      for (let y = 0; y < h; y++) blockRowOffsetByPixel[y] = Math.floor(y / bs) * bw;
+      const blockCapacity = bs * bs, blockValues = new Int32Array(blockCapacity), gapPreds = new Int32Array(blockCapacity), gapCtxIdxs = new Uint8Array(blockCapacity), medPreds = new Int32Array(blockCapacity), medCtxIdxs = new Uint8Array(blockCapacity), avgPreds = new Int32Array(blockCapacity), yBlock = yRes === null ? null : new Int32Array(blockCapacity), gapInfo = new Int32Array(2), medInfo = new Int32Array(2);
       for (let by = 0; by < bh; by++) {
         for (let bx = 0; bx < bw; bx++) {
           const yS = by * bs, yE = Math.min(yS + bs, h), xS = bx * bs, xE = Math.min(xS + bs, w);
@@ -574,8 +579,12 @@ var LFT_MODULE = (() => {
             for (let x = xS; x < xE; x++) {
               const i = y * w + x;
               blockValues[pos] = data[i];
-              gapPreds[pos] = this.gap(x, y, w, data).pred;
-              medPreds[pos] = this.med(x, y, w, data).pred;
+              this.gapInto(x, y, w, data, gapInfo);
+              this.medInto(x, y, w, data, medInfo);
+              gapPreds[pos] = gapInfo[0];
+              gapCtxIdxs[pos] = gapInfo[1];
+              medPreds[pos] = medInfo[0];
+              medCtxIdxs[pos] = medInfo[1];
               avgPreds[pos] = x > 0 && y > 0 ? data[i - 1] + data[i - w] >> 1 : y > 0 ? data[i - w] : x > 0 ? data[i - 1] : 128;
               if (yBlock !== null) yBlock[pos] = yRes[i];
               pos++;
@@ -605,6 +614,7 @@ var LFT_MODULE = (() => {
             for (let x = xS; x < xE; x++) {
               const i = y * w + x;
               planeResiduals[i] = blockValues[pos] - bestPreds[pos] - (yBlock === null ? 0 : yBlock[pos] * f >> 3);
+              planeCtxIdx[i] = bestM === 1 ? medCtxIdxs[pos] : gapCtxIdxs[pos];
               pos++;
             }
           }
@@ -687,16 +697,10 @@ var LFT_MODULE = (() => {
       const models = Array.from({ length: 1100 }, () => new Model());
       const biasSums = new Int32Array(1100), biasCounts = new Int32Array(1100);
       for (let y = 0; y < h; y++) {
-        const blockRowOffset = Math.floor(y / bs) * bw;
-        let blockX = 0, nextBlockEdge = bs;
         for (let x = 0; x < w; x++) {
-          if (x === nextBlockEdge) {
-            blockX++;
-            nextBlockEdge += bs;
-          }
-          const i = y * w + x, bp = blockParams[blockRowOffset + blockX];
+          const i = y * w + x, bp = blockParams[blockRowOffsetByPixel[y] + blockXByPixel[x]];
           if ((bp & 3) === 3) continue;
-          const isMed = (bp & 3) === 1, { ctxIdx } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
+          const ctxIdx = planeCtxIdx[i];
           let cS = 0;
           if (yRes === null) {
             const rL = x > 0 ? planeResiduals[i - 1] : 0, rU = y > 0 ? planeResiduals[i - w] : 0;
@@ -928,6 +932,9 @@ var LFT_MODULE = (() => {
         return sign === 1 ? -abs : abs;
       };
       const bw = Math.ceil(w / bs), bh = Math.ceil(h / bs), blockParams = new Int32Array(bw * bh);
+      const blockXByPixel = new Uint16Array(w), blockRowOffsetByPixel = new Int32Array(h);
+      for (let x = 0; x < w; x++) blockXByPixel[x] = Math.floor(x / bs);
+      for (let y = 0; y < h; y++) blockRowOffsetByPixel[y] = Math.floor(y / bs) * bw;
       const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
       for (let i = 0; i < bw * bh; i++) {
         let m = 0;
@@ -951,16 +958,10 @@ var LFT_MODULE = (() => {
       }
       const models = Array.from({ length: 1100 }, () => new Model());
       const biasSums = new Int32Array(1100), biasCounts = new Int32Array(1100);
-      const out = new Int32Array(w * h), planeRes = new Int32Array(w * h);
+      const out = new Int32Array(w * h), planeRes = new Int32Array(w * h), info = new Int32Array(2);
       for (let y = 0; y < h; y++) {
-        const blockRowOffset = Math.floor(y / bs) * bw;
-        let blockX = 0, nextBlockEdge = bs;
         for (let x = 0; x < w; x++) {
-          if (x === nextBlockEdge) {
-            blockX++;
-            nextBlockEdge += bs;
-          }
-          const i = y * w + x, bp2 = blockParams[blockRowOffset + blockX];
+          const i = y * w + x, bp2 = blockParams[blockRowOffsetByPixel[y] + blockXByPixel[x]];
           if ((bp2 & 3) === 3) {
             out[i] = this.unzigzag(bp2 >> 2);
             continue;
@@ -968,16 +969,17 @@ var LFT_MODULE = (() => {
           const m = bp2 & 3, f = ccpTrials[bp2 >> 2 & 15];
           let pr, ctxIdx;
           if (m === 0) {
-            const gap = this.gap(x, y, w, out);
-            pr = gap.pred;
-            ctxIdx = gap.ctxIdx;
+            this.gapInto(x, y, w, out, info);
+            pr = info[0];
+            ctxIdx = info[1];
           } else if (m === 1) {
-            const med = this.med(x, y, w, out);
-            pr = med.pred;
-            ctxIdx = med.ctxIdx;
+            this.medInto(x, y, w, out, info);
+            pr = info[0];
+            ctxIdx = info[1];
           } else {
             pr = x > 0 && y > 0 ? out[i - 1] + out[i - w] >> 1 : y > 0 ? out[i - w] : x > 0 ? out[i - 1] : 128;
-            ctxIdx = this.gap(x, y, w, out).ctxIdx;
+            this.gapInto(x, y, w, out, info);
+            ctxIdx = info[1];
           }
           let cS = 0;
           if (yRes === null) {
@@ -992,8 +994,9 @@ var LFT_MODULE = (() => {
           }
           const fIdx = ctxIdx * 12 + cS, model = models[fIdx], range = high - low + 1, count = Math.floor(((val - low + 1) * model.sum - 1) / range);
           const zz_c = model.find(count);
-          const nL = low + Math.floor(range * model.getCum(zz_c) / model.sum);
-          high = low + Math.floor(range * model.getCum(zz_c + 1) / model.sum) - 1;
+          const cum = model.getCum(zz_c), freq = model.getFreq(zz_c);
+          const nL = low + Math.floor(range * cum / model.sum);
+          high = low + Math.floor(range * (cum + freq) / model.sum) - 1;
           low = nL;
           while (true) {
             if (high < this.HALF) {
