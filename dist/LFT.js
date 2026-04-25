@@ -281,21 +281,28 @@ var LFT_MODULE = (() => {
             for (let y = yS; y < yE; y++) for (let x = xS; x < xE; x++) planeResiduals[y * w + x] = 0;
             continue;
           }
+          const blockArea = (yE - yS) * (xE - xS), blockValues = new Int32Array(blockArea), gapPreds = new Int32Array(blockArea), medPreds = new Int32Array(blockArea), avgPreds = new Int32Array(blockArea), yBlock = yRes === null ? null : new Int32Array(blockArea);
+          let pos = 0;
+          for (let y = yS; y < yE; y++) {
+            for (let x = xS; x < xE; x++) {
+              const i = y * w + x;
+              blockValues[pos] = data[i];
+              gapPreds[pos] = this.gap(x, y, w, data).pred;
+              medPreds[pos] = this.med(x, y, w, data).pred;
+              avgPreds[pos] = x > 0 && y > 0 ? data[i - 1] + data[i - w] >> 1 : y > 0 ? data[i - w] : x > 0 ? data[i - 1] : 128;
+              if (yBlock !== null) yBlock[pos] = yRes[i];
+              pos++;
+            }
+          }
           let bestM = 0, bestFIdx = 8, minE = Infinity;
           for (let m = 0; m < 3; m++) {
-            const fR = yRes === null ? [8] : Array.from({ length: 16 }, (_, i) => i);
-            for (const fIdx of fR) {
+            const preds = m === 0 ? gapPreds : m === 1 ? medPreds : avgPreds;
+            const fStart = yBlock === null ? 8 : 0, fEnd = yBlock === null ? 9 : 16;
+            for (let fIdx = fStart; fIdx < fEnd; fIdx++) {
               const f2 = ccpTrials[fIdx];
-              let err = 0;
-              for (let y = yS; y < yE; y++) {
-                for (let x = xS; x < xE; x++) {
-                  const i = y * w + x;
-                  let pr;
-                  if (m === 0) pr = this.gap(x, y, w, data).pred;
-                  else if (m === 1) pr = this.med(x, y, w, data).pred;
-                  else pr = x > 0 && y > 0 ? data[i - 1] + data[i - w] >> 1 : y > 0 ? data[i - w] : x > 0 ? data[i - 1] : 128;
-                  err += Math.abs(data[i] - pr - (yRes === null ? 0 : yRes[i] * f2 >> 3));
-                }
+              let err = 0, p = 0;
+              for (; p < blockArea; p++) {
+                err += Math.abs(blockValues[p] - preds[p] - (yBlock === null ? 0 : yBlock[p] * f2 >> 3));
               }
               if (err < minE) {
                 minE = err;
@@ -305,15 +312,13 @@ var LFT_MODULE = (() => {
             }
           }
           blockParams[by * bw + bx] = bestM | bestFIdx << 2;
-          const f = ccpTrials[bestFIdx];
+          const f = ccpTrials[bestFIdx], bestPreds = bestM === 0 ? gapPreds : bestM === 1 ? medPreds : avgPreds;
+          pos = 0;
           for (let y = yS; y < yE; y++) {
             for (let x = xS; x < xE; x++) {
               const i = y * w + x;
-              let pr;
-              if (bestM === 0) pr = this.gap(x, y, w, data).pred;
-              else if (bestM === 1) pr = this.med(x, y, w, data).pred;
-              else pr = x > 0 && y > 0 ? data[i - 1] + data[i - w] >> 1 : y > 0 ? data[i - w] : x > 0 ? data[i - 1] : 128;
-              planeResiduals[i] = data[i] - pr - (yRes === null ? 0 : yRes[i] * f >> 3);
+              planeResiduals[i] = blockValues[pos] - bestPreds[pos] - (yBlock === null ? 0 : yBlock[pos] * f >> 3);
+              pos++;
             }
           }
         }
@@ -449,7 +454,10 @@ var LFT_MODULE = (() => {
       if (bitCount > 0) output[op++] = currentByte << 8 - bitCount;
       const sH = new DataView(new ArrayBuffer(4));
       sH.setUint32(0, op);
-      return { output: new Uint8Array([...new Uint8Array(sH.buffer), ...output.subarray(0, op)]), residuals: planeResiduals };
+      const encoded = new Uint8Array(4 + op);
+      encoded.set(new Uint8Array(sH.buffer), 0);
+      encoded.set(output.subarray(0, op), 4);
+      return { output: encoded, residuals: planeResiduals };
     }
     static async decode(blob) {
       const ab = await blob.arrayBuffer(), dv = new DataView(ab);
@@ -611,11 +619,19 @@ var LFT_MODULE = (() => {
             continue;
           }
           const m = bp2 & 3, f = ccpTrials[bp2 >> 2 & 15];
-          let pr;
-          if (m === 0) pr = this.gap(x, y, w, out).pred;
-          else if (m === 1) pr = this.med(x, y, w, out).pred;
-          else pr = x > 0 && y > 0 ? out[i - 1] + out[i - w] >> 1 : y > 0 ? out[i - w] : x > 0 ? out[i - 1] : 128;
-          const isMed = m === 1, { ctxIdx } = isMed ? this.med(x, y, w, out) : this.gap(x, y, w, out);
+          let pr, ctxIdx;
+          if (m === 0) {
+            const gap = this.gap(x, y, w, out);
+            pr = gap.pred;
+            ctxIdx = gap.ctxIdx;
+          } else if (m === 1) {
+            const med = this.med(x, y, w, out);
+            pr = med.pred;
+            ctxIdx = med.ctxIdx;
+          } else {
+            pr = x > 0 && y > 0 ? out[i - 1] + out[i - w] >> 1 : y > 0 ? out[i - w] : x > 0 ? out[i - 1] : 128;
+            ctxIdx = this.gap(x, y, w, out).ctxIdx;
+          }
           let cS = 0;
           if (yRes === null) {
             const rL = x > 0 ? planeRes[i - 1] : 0, rU = y > 0 ? planeRes[i - w] : 0;

@@ -6,12 +6,15 @@
 	],
 	"settings": {
 		"cSpell.words": [
+			"freqs",
 			"Metas",
 			"Paeth",
+			"Preds",
 			"Subbands",
 			"tidx",
 			"unshuffle",
-			"unshuffled"
+			"unshuffled",
+			"unzigzag"
 		]
 	}
 }
