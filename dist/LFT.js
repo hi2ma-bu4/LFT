@@ -51,6 +51,7 @@ var LFT_MODULE = (() => {
       }
     }
     update(val, delta) {
+      if (delta === 0) return;
       this.sum += delta;
       this.freqs[val] += delta;
       for (let i = val + 1; i <= _Model.SIZE; i += i & -i) this.f[i] += delta;
@@ -118,9 +119,9 @@ var LFT_MODULE = (() => {
       if (dv - dh > 80) pred = w_;
       else if (dh - dv > 80) pred = n;
       else {
-        pred = (w_ + n) / 2 + (ne - nw) / 4;
-        if (dv - dh > 32) pred = (pred + w_) / 2;
-        else if (dh - dv > 32) pred = (pred + n) / 2;
+        pred = (w_ + n << 1) + ne - nw >> 2;
+        if (dv - dh > 32) pred = pred + w_ >> 1;
+        else if (dh - dv > 32) pred = pred + n >> 1;
       }
       const activity = dh + dv;
       let aL = 0;
@@ -134,7 +135,7 @@ var LFT_MODULE = (() => {
       if (activity > 250) aL = 8;
       if (activity > 450) aL = 9;
       if (activity > 750) aL = 10;
-      out[0] = Math.floor(pred);
+      out[0] = pred;
       out[1] = aL << 3 | ((w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0));
     }
     static medInto(x, y, w, data, out) {
@@ -159,7 +160,7 @@ var LFT_MODULE = (() => {
       if (activity > 250) aL = 8;
       if (activity > 450) aL = 9;
       if (activity > 750) aL = 10;
-      out[0] = Math.floor(pred);
+      out[0] = pred;
       out[1] = aL << 3 | ((w_ > nw ? 1 : 0) | (n > nw ? 2 : 0) | (n > ne ? 4 : 0));
     }
     static zigzag(v) {
@@ -777,8 +778,7 @@ var LFT_MODULE = (() => {
           indices = new Int32Array(raw.length);
           for (let i = 0; i < raw.length; i++) indices[i] = raw[i];
         } else {
-          const b = new Blob([ab.slice(14 + pS * 4)]);
-          indices = (await this.decodePlane(w, h, b, null, 16)).data;
+          indices = this.decodePlane(w, h, new Uint8Array(ab, 14 + pS * 4), null, 16).data;
         }
         const data = new Uint8Array(w * h * 4);
         for (let i = 0; i < w * h; i++) {
@@ -863,8 +863,8 @@ var LFT_MODULE = (() => {
       let yRes = null;
       const numPlanes = (isG ? 1 : 3) + (cA ? 0 : 1);
       for (let p = 0; p < numPlanes; p++) {
-        const size = dv.getUint32(offset), blob2 = new Blob([ab.slice(offset)]), useY = !isG && (p === 1 || p === 2);
-        const { data: dP, residuals: res } = await this.decodePlane(w, h, blob2, useY ? yRes : null, bs);
+        const size = dv.getUint32(offset), useY = !isG && (p === 1 || p === 2);
+        const { data: dP, residuals: res } = this.decodePlane(w, h, new Uint8Array(ab, offset, 4 + size), useY ? yRes : null, bs);
         planes.push(dP);
         if (p === 0) yRes = res;
         offset += 4 + size;
@@ -887,8 +887,8 @@ var LFT_MODULE = (() => {
       }
       return { w, h, data: rgba };
     }
-    static async decodePlane(w, h, blob, yRes, bs) {
-      const ab = await blob.arrayBuffer(), buf = new Uint8Array(ab.slice(4));
+    static decodePlane(w, h, planeBytes, yRes, bs) {
+      const buf = planeBytes.subarray(4);
       let bp = 0, bitIdx = 0;
       const getBit = () => {
         if (bp >= buf.length) return 0;
