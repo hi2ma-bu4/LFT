@@ -1,17 +1,31 @@
 class Model {
 	public static readonly SIZE = 257;
+	private static readonly UNIFORM_FREQS = (() => {
+		const freqs = new Uint32Array(Model.SIZE);
+		freqs.fill(1);
+		return freqs;
+	})();
+	private static readonly UNIFORM_FENWICK = (() => {
+		const fenwick = new Uint32Array(Model.SIZE + 1);
+		for (let i = 1; i <= Model.SIZE; i++) {
+			fenwick[i] += 1;
+			const parent = i + (i & -i);
+			if (parent <= Model.SIZE) fenwick[parent] += fenwick[i];
+		}
+		return fenwick;
+	})();
 	private readonly f = new Uint32Array(Model.SIZE + 1);
 	private readonly freqs = new Uint32Array(Model.SIZE);
 	public sum = 0;
 
 	constructor() {
-		this.resetUniform();
+		this.reset();
 	}
 
-	private resetUniform(): void {
-		this.freqs.fill(1);
+	public reset(): void {
+		this.freqs.set(Model.UNIFORM_FREQS);
+		this.f.set(Model.UNIFORM_FENWICK);
 		this.sum = Model.SIZE;
-		this.rebuildFenwick();
 	}
 
 	private rebuildFenwick(): void {
@@ -75,12 +89,28 @@ type DominantOverlayComponent = {
 	pixels: number[];
 };
 
+type BlockLayout = {
+	bs: number;
+	bw: number;
+	bh: number;
+	blockXByPixel: Uint16Array;
+	blockRowOffsetByPixel: Int32Array;
+};
+
+type ModelWorkspace = {
+	models: Model[];
+	biasSums: Int32Array;
+	biasCounts: Int32Array;
+};
+
 export class LFT {
 	private static readonly MAGIC = new Uint8Array([76, 70, 84, 33]);
 	private static readonly COMPRESSED_RAW_FORMATS = [
 		{ code: 0, format: "deflate" },
 		{ code: 1, format: "brotli" },
 	] as const;
+	private static readonly CCP_TRIALS = new Int8Array([-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12]);
+	private static readonly MODEL_COUNT = 1100;
 
 	private static rgbToYCoCgR(r: number, g: number, b: number): [number, number, number] {
 		const co = r - b;
@@ -170,6 +200,46 @@ export class LFT {
 	private static readonly RANGE_MAX = 0x3fffffff;
 	private static readonly HALF = 0x20000000;
 	private static readonly QUARTER = 0x10000000;
+
+	private static createBlockLayout(w: number, h: number, bs: number): BlockLayout {
+		const bw = Math.ceil(w / bs),
+			bh = Math.ceil(h / bs);
+		const blockXByPixel = new Uint16Array(w),
+			blockRowOffsetByPixel = new Int32Array(h);
+		let blockX = 0,
+			nextBlockX = bs;
+		for (let x = 0; x < w; x++) {
+			if (x === nextBlockX) {
+				blockX++;
+				nextBlockX += bs;
+			}
+			blockXByPixel[x] = blockX;
+		}
+		let blockY = 0,
+			nextBlockY = bs;
+		for (let y = 0; y < h; y++) {
+			if (y === nextBlockY) {
+				blockY++;
+				nextBlockY += bs;
+			}
+			blockRowOffsetByPixel[y] = blockY * bw;
+		}
+		return { bs, bw, bh, blockXByPixel, blockRowOffsetByPixel };
+	}
+
+	private static createModelWorkspace(): ModelWorkspace {
+		return {
+			models: Array.from({ length: this.MODEL_COUNT }, () => new Model()),
+			biasSums: new Int32Array(this.MODEL_COUNT),
+			biasCounts: new Int32Array(this.MODEL_COUNT),
+		};
+	}
+
+	private static resetModelWorkspace(workspace: ModelWorkspace): void {
+		workspace.biasSums.fill(0);
+		workspace.biasCounts.fill(0);
+		for (const model of workspace.models) model.reset();
+	}
 
 	private static createRawData(w: number, h: number, rgba: Uint8Array<ArrayBuffer>, isG: boolean, cA: boolean): Uint8Array<ArrayBuffer> {
 		const len = w * h,
@@ -531,13 +601,15 @@ export class LFT {
 			head.setUint32(13, colors.values().next().value as number);
 			return new Blob([head]);
 		}
+		const modelWorkspace = this.createModelWorkspace();
+		const blockLayout16 = this.createBlockLayout(w, h, 16);
 		if (colors.size <= 256) {
 			const palette = Array.from(colors).sort((a, b) => (a >>> 0) - (b >>> 0));
 			const colorToIndex = new Map<number, number>();
 			palette.forEach((c, i) => colorToIndex.set(c, i));
 			const indices = new Int32Array(len);
 			for (let i = 0; i < len; i++) indices[i] = colorToIndex.get((rgba[i * 4] << 24) | (rgba[i * 4 + 1] << 16) | (rgba[i * 4 + 2] << 8) | rgba[i * 4 + 3])!;
-			const { output: encI } = await this.encodePlane(w, h, indices, null, 16);
+			const { output: encI } = this.encodePlane(w, h, indices, null, blockLayout16, modelWorkspace);
 			const useRawI = encI.length > len,
 				pModeSize = 14 + colors.size * 4 + (useRawI ? len : encI.length);
 			if (cA && a0 === 255) applyCandidate(await this.createDominantOverlayCandidate(w, h, palette, indices, bestCandidate.size));
@@ -580,12 +652,12 @@ export class LFT {
 		let bestTSize = Infinity,
 			bestBS = 16,
 			bestPlanes: Uint8Array<ArrayBuffer>[] = [];
-		for (const bs of [16, 32]) {
+		for (const layout of [blockLayout16, this.createBlockLayout(w, h, 32)]) {
 			let currentP: Uint8Array<ArrayBuffer>[] = [],
 				currentS = 0,
 				yRes: Int32Array | null = null;
 			for (let p = 0; p < planes.length; p++) {
-				const { output: res, residuals } = await this.encodePlane(w, h, planes[p], !isG && (p === 1 || p === 2) ? yRes : null, bs);
+				const { output: res, residuals } = this.encodePlane(w, h, planes[p], !isG && (p === 1 || p === 2) ? yRes : null, layout, modelWorkspace);
 				currentP.push(res);
 				currentS += res.length;
 				if (p === 0) yRes = residuals;
@@ -593,7 +665,7 @@ export class LFT {
 			if (currentS < bestTSize) {
 				bestTSize = currentS;
 				bestPlanes = currentP;
-				bestBS = bs;
+				bestBS = layout.bs;
 			}
 		}
 		if (16 + bestTSize < rawModeSize) {
@@ -612,18 +684,20 @@ export class LFT {
 		return new Blob(bestCandidate.parts);
 	}
 
-	private static async encodePlane(w: number, h: number, data: Int32Array, yRes: Int32Array | null, bs: number): Promise<{ output: Uint8Array<ArrayBuffer>; residuals: Int32Array }> {
-		const bw = Math.ceil(w / bs),
-			bh = Math.ceil(h / bs),
+	private static encodePlane(
+		w: number,
+		h: number,
+		data: Int32Array,
+		yRes: Int32Array | null,
+		layout: BlockLayout,
+		modelWorkspace: ModelWorkspace
+	): { output: Uint8Array<ArrayBuffer>; residuals: Int32Array } {
+		const { bs, bw, bh, blockXByPixel, blockRowOffsetByPixel } = layout,
 			len = w * h;
-		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
+		const ccpTrials = this.CCP_TRIALS;
 		const blockParams = new Int32Array(bw * bh),
 			planeResiduals = new Int32Array(len),
 			planeCtxIdx = new Uint8Array(len);
-		const blockXByPixel = new Uint16Array(w),
-			blockRowOffsetByPixel = new Int32Array(h);
-		for (let x = 0; x < w; x++) blockXByPixel[x] = Math.floor(x / bs);
-		for (let y = 0; y < h; y++) blockRowOffsetByPixel[y] = Math.floor(y / bs) * bw;
 		const blockCapacity = bs * bs,
 			blockValues = new Int32Array(blockCapacity),
 			gapPreds = new Int32Array(blockCapacity),
@@ -789,9 +863,8 @@ export class LFT {
 				}
 			} else encodeEscaped(this.unzigzag(p >> 2));
 		}
-		const models = Array.from({ length: 1100 }, () => new Model());
-		const biasSums = new Int32Array(1100),
-			biasCounts = new Int32Array(1100);
+		this.resetModelWorkspace(modelWorkspace);
+		const { models, biasSums, biasCounts } = modelWorkspace;
 		for (let y = 0; y < h; y++) {
 			for (let x = 0; x < w; x++) {
 				const i = y * w + x,
@@ -892,11 +965,12 @@ export class LFT {
 			for (let i = 0; i < pS; i++) palette[i] = dv.getUint32(14 + i * 4);
 			let indices: Int32Array;
 			if (mode === 4) {
-				const raw = new Uint8Array(ab.slice(14 + pS * 4));
+				const raw = new Uint8Array(ab, 14 + pS * 4);
 				indices = new Int32Array(raw.length);
 				for (let i = 0; i < raw.length; i++) indices[i] = raw[i];
 			} else {
-				indices = this.decodePlane(w, h, new Uint8Array(ab, 14 + pS * 4), null, 16).data;
+				const modelWorkspace = this.createModelWorkspace();
+				indices = this.decodePlane(w, h, new Uint8Array(ab, 14 + pS * 4), null, this.createBlockLayout(w, h, 16), modelWorkspace).data;
 			}
 			const data = new Uint8Array(w * h * 4);
 			for (let i = 0; i < w * h; i++) {
@@ -913,17 +987,17 @@ export class LFT {
 			isG = (flags & 2) === 2,
 			a0 = dv.getUint8(14);
 		if (mode === 3) {
-			return { w, h, data: this.decodeRawData(w, h, new Uint8Array(ab.slice(15)), isG, cA, a0) };
+			return { w, h, data: this.decodeRawData(w, h, new Uint8Array(ab, 15), isG, cA, a0) };
 		}
 		if (mode === 5) {
 			const formatCode = dv.getUint8(15),
-				raw = await this.runDecompression(new Uint8Array(ab.slice(16)), this.getCompressedRawFormat(formatCode));
+				raw = await this.runDecompression(new Uint8Array(ab, 16), this.getCompressedRawFormat(formatCode));
 			return { w, h, data: this.decodeRawData(w, h, raw, isG, cA, a0) };
 		}
 		if (mode === 6) {
 			const topK = dv.getUint8(14),
 				componentSpan = dv.getUint8(15),
-				payload = await this.runDecompression(new Uint8Array(ab.slice(16)), this.getCompressedRawFormat(dv.getUint8(13))),
+				payload = await this.runDecompression(new Uint8Array(ab, 16), this.getCompressedRawFormat(dv.getUint8(13))),
 				len = w * h;
 			let offset = 0;
 			const labels = payload.subarray(offset, offset + len);
@@ -995,12 +1069,14 @@ export class LFT {
 		let offset = 16;
 		const bs = dv.getUint8(15),
 			planes: Int32Array[] = [];
+		const blockLayout = this.createBlockLayout(w, h, bs),
+			modelWorkspace = this.createModelWorkspace();
 		let yRes: Int32Array | null = null;
 		const numPlanes = (isG ? 1 : 3) + (cA ? 0 : 1);
 		for (let p = 0; p < numPlanes; p++) {
 			const size = dv.getUint32(offset),
 				useY = !isG && (p === 1 || p === 2);
-			const { data: dP, residuals: res } = this.decodePlane(w, h, new Uint8Array(ab, offset, 4 + size), useY ? yRes : null, bs);
+			const { data: dP, residuals: res } = this.decodePlane(w, h, new Uint8Array(ab, offset, 4 + size), useY ? yRes : null, blockLayout, modelWorkspace);
 			planes.push(dP);
 			if (p === 0) yRes = res;
 			offset += 4 + size;
@@ -1024,7 +1100,14 @@ export class LFT {
 		return { w, h, data: rgba };
 	}
 
-	private static decodePlane(w: number, h: number, planeBytes: Uint8Array<ArrayBuffer>, yRes: Int32Array | null, bs: number): { data: Int32Array; residuals: Int32Array } {
+	private static decodePlane(
+		w: number,
+		h: number,
+		planeBytes: Uint8Array<ArrayBuffer>,
+		yRes: Int32Array | null,
+		layout: BlockLayout,
+		modelWorkspace: ModelWorkspace
+	): { data: Int32Array; residuals: Int32Array } {
 		const buf = planeBytes.subarray(4);
 		let bp = 0,
 			bitIdx = 0;
@@ -1072,14 +1155,9 @@ export class LFT {
 			for (let b = 0; b < k + 8; b++) abs = (abs << 1) | decodeBitRaw();
 			return sign === 1 ? -abs : abs;
 		};
-		const bw = Math.ceil(w / bs),
-			bh = Math.ceil(h / bs),
+		const { bw, bh, blockXByPixel, blockRowOffsetByPixel } = layout,
 			blockParams = new Int32Array(bw * bh);
-		const blockXByPixel = new Uint16Array(w),
-			blockRowOffsetByPixel = new Int32Array(h);
-		for (let x = 0; x < w; x++) blockXByPixel[x] = Math.floor(x / bs);
-		for (let y = 0; y < h; y++) blockRowOffsetByPixel[y] = Math.floor(y / bs) * bw;
-		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
+		const ccpTrials = this.CCP_TRIALS;
 		for (let i = 0; i < bw * bh; i++) {
 			let m = 0;
 			if (decodeBitRaw() === 0) {
@@ -1100,9 +1178,8 @@ export class LFT {
 				blockParams[i] = m | (fIdx << 2);
 			} else blockParams[i] = m | (this.zigzag(decodeEscaped()) << 2);
 		}
-		const models = Array.from({ length: 1100 }, () => new Model());
-		const biasSums = new Int32Array(1100),
-			biasCounts = new Int32Array(1100);
+		this.resetModelWorkspace(modelWorkspace);
+		const { models, biasSums, biasCounts } = modelWorkspace;
 		const out = new Int32Array(w * h),
 			planeRes = new Int32Array(w * h),
 			info = new Int32Array(2);

@@ -18,11 +18,12 @@ describe("LFT Codec Verification", () => {
 			const { width, height, data } = png;
 
 			// Encode
-			const blob = await LFT.encode(width, height, data);
-			const compressedBuffer = Buffer.from(await blob.arrayBuffer());
-			const compressedSize = compressedBuffer.length;
+			const blob = await LFT.encode(width, height, data as Uint8Array<ArrayBuffer>);
+			const compressedSize = blob.size;
 			const originalRawSize = width * height * 4; // RGBA
 			const compressionRatio = (compressedSize / originalRawSize) * 100;
+			expect(compressedSize).toBeGreaterThan(0);
+			expect(originalRawSize).toBeGreaterThan(0);
 
 			console.log(`${imageFile}:`);
 			console.log(`  Original RAW size (RGBA): ${originalRawSize} bytes`);
@@ -36,13 +37,7 @@ describe("LFT Codec Verification", () => {
 			expect(decoded.data.length).toBe(data.length);
 
 			// Verify bit-perfect reconstruction
-			for (let i = 0; i < data.length; i++) {
-				if (decoded.data[i] !== data[i]) {
-					throw new Error(`Mismatch at index ${i}: expected ${data[i]}, got ${decoded.data[i]}`);
-				}
-			}
-			// Faster check
-			expect(Buffer.from(decoded.data).equals(data)).toBe(true);
+			expect(Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength).equals(data)).toBe(true);
 		}, 600000); // 10 minutes timeout
 	});
 });

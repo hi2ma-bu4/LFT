@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "author": "hi2ma-bu4",
   "type": "module",
-  "main": "src/codec.ts",
+  "main": "src/index.ts",
   "scripts": {
     "build": "node dev/build.mjs",
     "test": "vitest run"
