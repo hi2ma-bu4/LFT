@@ -1,14 +1,31 @@
 class Model {
 	public static readonly SIZE = 257;
 	private readonly f = new Uint32Array(Model.SIZE + 1);
+	private readonly freqs = new Uint32Array(Model.SIZE);
 	public sum = 0;
 
 	constructor() {
-		for (let i = 1; i <= Model.SIZE; i++) this.update(i - 1, 1);
+		this.resetUniform();
+	}
+
+	private resetUniform(): void {
+		this.freqs.fill(1);
+		this.sum = Model.SIZE;
+		this.rebuildFenwick();
+	}
+
+	private rebuildFenwick(): void {
+		this.f.fill(0);
+		for (let i = 1; i <= Model.SIZE; i++) {
+			this.f[i] += this.freqs[i - 1];
+			const parent = i + (i & -i);
+			if (parent <= Model.SIZE) this.f[parent] += this.f[i];
+		}
 	}
 
 	public update(val: number, delta: number): void {
 		this.sum += delta;
+		this.freqs[val] += delta;
 		for (let i = val + 1; i <= Model.SIZE; i += i & -i) this.f[i] += delta;
 	}
 
@@ -19,7 +36,7 @@ class Model {
 	}
 
 	public getFreq(val: number): number {
-		return this.getCum(val + 1) - this.getCum(val);
+		return this.freqs[val];
 	}
 
 	public find(count: number): number {
@@ -35,11 +52,13 @@ class Model {
 	}
 
 	public resort(): void {
-		const freqs = new Uint32Array(Model.SIZE);
-		for (let i = 0; i < Model.SIZE; i++) freqs[i] = this.getFreq(i);
-		this.f.fill(0);
 		this.sum = 0;
-		for (let i = 0; i < Model.SIZE; i++) this.update(i, (freqs[i] >> 1) | 1);
+		for (let i = 0; i < Model.SIZE; i++) {
+			const freq = (this.freqs[i] >> 1) | 1;
+			this.freqs[i] = freq;
+			this.sum += freq;
+		}
+		this.rebuildFenwick();
 	}
 }
 
@@ -261,6 +280,12 @@ export class LFT {
 		const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
 		const blockParams = new Int32Array(bw * bh),
 			planeResiduals = new Int32Array(len);
+		const blockCapacity = bs * bs,
+			blockValues = new Int32Array(blockCapacity),
+			gapPreds = new Int32Array(blockCapacity),
+			medPreds = new Int32Array(blockCapacity),
+			avgPreds = new Int32Array(blockCapacity),
+			yBlock = yRes === null ? null : new Int32Array(blockCapacity);
 		for (let by = 0; by < bh; by++) {
 			for (let bx = 0; bx < bw; bx++) {
 				const yS = by * bs,
@@ -282,12 +307,7 @@ export class LFT {
 					for (let y = yS; y < yE; y++) for (let x = xS; x < xE; x++) planeResiduals[y * w + x] = 0;
 					continue;
 				}
-				const blockArea = (yE - yS) * (xE - xS),
-					blockValues = new Int32Array(blockArea),
-					gapPreds = new Int32Array(blockArea),
-					medPreds = new Int32Array(blockArea),
-					avgPreds = new Int32Array(blockArea),
-					yBlock = yRes === null ? null : new Int32Array(blockArea);
+				const blockArea = (yE - yS) * (xE - xS);
 				let pos = 0;
 				for (let y = yS; y < yE; y++) {
 					for (let x = xS; x < xE; x++) {
@@ -417,12 +437,19 @@ export class LFT {
 			} else encodeEscaped(this.unzigzag(p >> 2));
 		}
 		const models = Array.from({ length: 1100 }, () => new Model());
-		const biasModels = Array.from({ length: 1100 }, () => ({ sum: 0, count: 0 }));
+		const biasSums = new Int32Array(1100),
+			biasCounts = new Int32Array(1100);
 		for (let y = 0; y < h; y++) {
-			const by = Math.floor(y / bs);
+			const blockRowOffset = Math.floor(y / bs) * bw;
+			let blockX = 0,
+				nextBlockEdge = bs;
 			for (let x = 0; x < w; x++) {
+				if (x === nextBlockEdge) {
+					blockX++;
+					nextBlockEdge += bs;
+				}
 				const i = y * w + x,
-					bp = blockParams[by * bw + Math.floor(x / bs)];
+					bp = blockParams[blockRowOffset + blockX];
 				if ((bp & 3) === 3) continue;
 				const isMed = (bp & 3) === 1,
 					{ ctxIdx } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
@@ -445,7 +472,8 @@ export class LFT {
 				const fIdx = ctxIdx * 12 + cS,
 					model = models[fIdx],
 					res = planeResiduals[i];
-				const bias = biasModels[fIdx].count > 0 ? Math.trunc(biasModels[fIdx].sum / biasModels[fIdx].count) : 0;
+				const biasCount = biasCounts[fIdx],
+					bias = biasCount > 0 ? Math.trunc(biasSums[fIdx] / biasCount) : 0;
 				const diff = res - bias,
 					zz = this.zigzag(diff) >>> 0,
 					zz_c = zz >= 256 ? 256 : zz;
@@ -470,11 +498,11 @@ export class LFT {
 					high = ((high << 1) | 1) >>> 0;
 				}
 				if (zz_c === 256) encodeEscaped(diff);
-				biasModels[fIdx].sum += res;
-				biasModels[fIdx].count++;
-				if (biasModels[fIdx].count === 128) {
-					biasModels[fIdx].sum >>= 1;
-					biasModels[fIdx].count >>= 1;
+				biasSums[fIdx] += res;
+				biasCounts[fIdx]++;
+				if (biasCounts[fIdx] === 128) {
+					biasSums[fIdx] >>= 1;
+					biasCounts[fIdx] >>= 1;
 				}
 				model.update(zz_c, model.sum < 32768 ? (model.sum < 1024 ? 32 : model.sum < 4096 ? 16 : 8) : 0);
 				if (model.sum >= 32768) model.resort();
@@ -666,15 +694,21 @@ export class LFT {
 			} else blockParams[i] = m | (this.zigzag(decodeEscaped()) << 2);
 		}
 		const models = Array.from({ length: 1100 }, () => new Model());
-		const biasModels = Array.from({ length: 1100 }, () => ({ sum: 0, count: 0 }));
+		const biasSums = new Int32Array(1100),
+			biasCounts = new Int32Array(1100);
 		const out = new Int32Array(w * h),
 			planeRes = new Int32Array(w * h);
 		for (let y = 0; y < h; y++) {
-			const by = Math.floor(y / bs);
+			const blockRowOffset = Math.floor(y / bs) * bw;
+			let blockX = 0,
+				nextBlockEdge = bs;
 			for (let x = 0; x < w; x++) {
+				if (x === nextBlockEdge) {
+					blockX++;
+					nextBlockEdge += bs;
+				}
 				const i = y * w + x,
-					bx = Math.floor(x / bs),
-					bp = blockParams[by * bw + bx];
+					bp = blockParams[blockRowOffset + blockX];
 				if ((bp & 3) === 3) {
 					out[i] = this.unzigzag(bp >> 2);
 					continue;
@@ -733,16 +767,17 @@ export class LFT {
 					high = ((high << 1) | 1) >>> 0;
 					val = ((val << 1) | getBit()) >>> 0;
 				}
-				let diff = zz_c === 256 ? decodeEscaped() : this.unzigzag(zz_c);
-				const bias = biasModels[fIdx].count > 0 ? Math.trunc(biasModels[fIdx].sum / biasModels[fIdx].count) : 0;
+				const diff = zz_c === 256 ? decodeEscaped() : this.unzigzag(zz_c);
+				const biasCount = biasCounts[fIdx],
+					bias = biasCount > 0 ? Math.trunc(biasSums[fIdx] / biasCount) : 0;
 				const res = diff + bias;
 				planeRes[i] = res;
 				out[i] = res + pr + (yRes === null ? 0 : (yRes[i] * f) >> 3);
-				biasModels[fIdx].sum += res;
-				biasModels[fIdx].count++;
-				if (biasModels[fIdx].count === 128) {
-					biasModels[fIdx].sum >>= 1;
-					biasModels[fIdx].count >>= 1;
+				biasSums[fIdx] += res;
+				biasCounts[fIdx]++;
+				if (biasCounts[fIdx] === 128) {
+					biasSums[fIdx] >>= 1;
+					biasCounts[fIdx] >>= 1;
 				}
 				model.update(zz_c, model.sum < 32768 ? (model.sum < 1024 ? 32 : model.sum < 4096 ? 16 : 8) : 0);
 				if (model.sum >= 32768) model.resort();

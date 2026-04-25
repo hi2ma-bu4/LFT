@@ -32,12 +32,27 @@ var LFT_MODULE = (() => {
   var Model = class _Model {
     static SIZE = 257;
     f = new Uint32Array(_Model.SIZE + 1);
+    freqs = new Uint32Array(_Model.SIZE);
     sum = 0;
     constructor() {
-      for (let i = 1; i <= _Model.SIZE; i++) this.update(i - 1, 1);
+      this.resetUniform();
+    }
+    resetUniform() {
+      this.freqs.fill(1);
+      this.sum = _Model.SIZE;
+      this.rebuildFenwick();
+    }
+    rebuildFenwick() {
+      this.f.fill(0);
+      for (let i = 1; i <= _Model.SIZE; i++) {
+        this.f[i] += this.freqs[i - 1];
+        const parent = i + (i & -i);
+        if (parent <= _Model.SIZE) this.f[parent] += this.f[i];
+      }
     }
     update(val, delta) {
       this.sum += delta;
+      this.freqs[val] += delta;
       for (let i = val + 1; i <= _Model.SIZE; i += i & -i) this.f[i] += delta;
     }
     getCum(val) {
@@ -46,7 +61,7 @@ var LFT_MODULE = (() => {
       return s;
     }
     getFreq(val) {
-      return this.getCum(val + 1) - this.getCum(val);
+      return this.freqs[val];
     }
     find(count) {
       let idx = 0;
@@ -60,11 +75,13 @@ var LFT_MODULE = (() => {
       return idx;
     }
     resort() {
-      const freqs = new Uint32Array(_Model.SIZE);
-      for (let i = 0; i < _Model.SIZE; i++) freqs[i] = this.getFreq(i);
-      this.f.fill(0);
       this.sum = 0;
-      for (let i = 0; i < _Model.SIZE; i++) this.update(i, freqs[i] >> 1 | 1);
+      for (let i = 0; i < _Model.SIZE; i++) {
+        const freq = this.freqs[i] >> 1 | 1;
+        this.freqs[i] = freq;
+        this.sum += freq;
+      }
+      this.rebuildFenwick();
     }
   };
   var LFT = class {
@@ -264,6 +281,7 @@ var LFT_MODULE = (() => {
       const bw = Math.ceil(w / bs), bh = Math.ceil(h / bs), len = w * h;
       const ccpTrials = [-16, -12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12];
       const blockParams = new Int32Array(bw * bh), planeResiduals = new Int32Array(len);
+      const blockCapacity = bs * bs, blockValues = new Int32Array(blockCapacity), gapPreds = new Int32Array(blockCapacity), medPreds = new Int32Array(blockCapacity), avgPreds = new Int32Array(blockCapacity), yBlock = yRes === null ? null : new Int32Array(blockCapacity);
       for (let by = 0; by < bh; by++) {
         for (let bx = 0; bx < bw; bx++) {
           const yS = by * bs, yE = Math.min(yS + bs, h), xS = bx * bs, xE = Math.min(xS + bs, w);
@@ -281,7 +299,7 @@ var LFT_MODULE = (() => {
             for (let y = yS; y < yE; y++) for (let x = xS; x < xE; x++) planeResiduals[y * w + x] = 0;
             continue;
           }
-          const blockArea = (yE - yS) * (xE - xS), blockValues = new Int32Array(blockArea), gapPreds = new Int32Array(blockArea), medPreds = new Int32Array(blockArea), avgPreds = new Int32Array(blockArea), yBlock = yRes === null ? null : new Int32Array(blockArea);
+          const blockArea = (yE - yS) * (xE - xS);
           let pos = 0;
           for (let y = yS; y < yE; y++) {
             for (let x = xS; x < xE; x++) {
@@ -398,11 +416,16 @@ var LFT_MODULE = (() => {
         } else encodeEscaped(this.unzigzag(p >> 2));
       }
       const models = Array.from({ length: 1100 }, () => new Model());
-      const biasModels = Array.from({ length: 1100 }, () => ({ sum: 0, count: 0 }));
+      const biasSums = new Int32Array(1100), biasCounts = new Int32Array(1100);
       for (let y = 0; y < h; y++) {
-        const by = Math.floor(y / bs);
+        const blockRowOffset = Math.floor(y / bs) * bw;
+        let blockX = 0, nextBlockEdge = bs;
         for (let x = 0; x < w; x++) {
-          const i = y * w + x, bp = blockParams[by * bw + Math.floor(x / bs)];
+          if (x === nextBlockEdge) {
+            blockX++;
+            nextBlockEdge += bs;
+          }
+          const i = y * w + x, bp = blockParams[blockRowOffset + blockX];
           if ((bp & 3) === 3) continue;
           const isMed = (bp & 3) === 1, { ctxIdx } = isMed ? this.med(x, y, w, data) : this.gap(x, y, w, data);
           let cS = 0;
@@ -417,7 +440,7 @@ var LFT_MODULE = (() => {
             cS = s === 0 ? sC > 3 ? 3 : sC : a <= 2 ? s + 4 : a <= 10 ? s + 6 : s + 8;
           }
           const fIdx = ctxIdx * 12 + cS, model = models[fIdx], res = planeResiduals[i];
-          const bias = biasModels[fIdx].count > 0 ? Math.trunc(biasModels[fIdx].sum / biasModels[fIdx].count) : 0;
+          const biasCount = biasCounts[fIdx], bias = biasCount > 0 ? Math.trunc(biasSums[fIdx] / biasCount) : 0;
           const diff = res - bias, zz = this.zigzag(diff) >>> 0, zz_c = zz >= 256 ? 256 : zz;
           const range = high - low + 1, cum = model.getCum(zz_c), freq = model.getFreq(zz_c);
           const nL = low + Math.floor(range * cum / model.sum);
@@ -438,11 +461,11 @@ var LFT_MODULE = (() => {
             high = (high << 1 | 1) >>> 0;
           }
           if (zz_c === 256) encodeEscaped(diff);
-          biasModels[fIdx].sum += res;
-          biasModels[fIdx].count++;
-          if (biasModels[fIdx].count === 128) {
-            biasModels[fIdx].sum >>= 1;
-            biasModels[fIdx].count >>= 1;
+          biasSums[fIdx] += res;
+          biasCounts[fIdx]++;
+          if (biasCounts[fIdx] === 128) {
+            biasSums[fIdx] >>= 1;
+            biasCounts[fIdx] >>= 1;
           }
           model.update(zz_c, model.sum < 32768 ? model.sum < 1024 ? 32 : model.sum < 4096 ? 16 : 8 : 0);
           if (model.sum >= 32768) model.resort();
@@ -608,12 +631,17 @@ var LFT_MODULE = (() => {
         } else blockParams[i] = m | this.zigzag(decodeEscaped()) << 2;
       }
       const models = Array.from({ length: 1100 }, () => new Model());
-      const biasModels = Array.from({ length: 1100 }, () => ({ sum: 0, count: 0 }));
+      const biasSums = new Int32Array(1100), biasCounts = new Int32Array(1100);
       const out = new Int32Array(w * h), planeRes = new Int32Array(w * h);
       for (let y = 0; y < h; y++) {
-        const by = Math.floor(y / bs);
+        const blockRowOffset = Math.floor(y / bs) * bw;
+        let blockX = 0, nextBlockEdge = bs;
         for (let x = 0; x < w; x++) {
-          const i = y * w + x, bx = Math.floor(x / bs), bp2 = blockParams[by * bw + bx];
+          if (x === nextBlockEdge) {
+            blockX++;
+            nextBlockEdge += bs;
+          }
+          const i = y * w + x, bp2 = blockParams[blockRowOffset + blockX];
           if ((bp2 & 3) === 3) {
             out[i] = this.unzigzag(bp2 >> 2);
             continue;
@@ -663,16 +691,16 @@ var LFT_MODULE = (() => {
             high = (high << 1 | 1) >>> 0;
             val = (val << 1 | getBit()) >>> 0;
           }
-          let diff = zz_c === 256 ? decodeEscaped() : this.unzigzag(zz_c);
-          const bias = biasModels[fIdx].count > 0 ? Math.trunc(biasModels[fIdx].sum / biasModels[fIdx].count) : 0;
+          const diff = zz_c === 256 ? decodeEscaped() : this.unzigzag(zz_c);
+          const biasCount = biasCounts[fIdx], bias = biasCount > 0 ? Math.trunc(biasSums[fIdx] / biasCount) : 0;
           const res = diff + bias;
           planeRes[i] = res;
           out[i] = res + pr + (yRes === null ? 0 : yRes[i] * f >> 3);
-          biasModels[fIdx].sum += res;
-          biasModels[fIdx].count++;
-          if (biasModels[fIdx].count === 128) {
-            biasModels[fIdx].sum >>= 1;
-            biasModels[fIdx].count >>= 1;
+          biasSums[fIdx] += res;
+          biasCounts[fIdx]++;
+          if (biasCounts[fIdx] === 128) {
+            biasSums[fIdx] >>= 1;
+            biasCounts[fIdx] >>= 1;
           }
           model.update(zz_c, model.sum < 32768 ? model.sum < 1024 ? 32 : model.sum < 4096 ? 16 : 8 : 0);
           if (model.sum >= 32768) model.resort();
